@@ -11,6 +11,8 @@ and backed by a **Supabase Postgres** database.
 
 The working vertical slice:
 - A search page listing healthcare **organizations** (the directory).
+- **Providers** (clinicians: name, NPI, specialty) under organizations, with
+  server-side specialty/capability search and a combined directory search.
 - A **"Send referral"** action that POSTs a referral and persists it.
 
 Everything else in CLAUDE.md (workflow engine, agent layer, etc.) is vision, not
@@ -41,13 +43,18 @@ Browser ──> Next.js app on Vercel ──> Supabase Postgres
 | `app/page.tsx` | Search UI + "Send referral" button |
 | `app/layout.tsx` | Nav/shell |
 | `app/api/organizations/route.ts` | `GET /api/organizations?q=` |
+| `app/api/providers/route.ts` | `GET /api/providers?specialty=&org_id=&q=` |
+| `app/api/directory/route.ts` | `GET /api/directory?q=` (combined orgs + providers) |
 | `app/api/referrals/route.ts` | `POST /api/referrals` |
 | `app/api/health/route.ts` | `GET /api/health` |
 | `lib/organizations.ts` | Org query + search logic |
+| `lib/providers.ts` | Provider query + specialty/capability search |
+| `lib/directory.ts` | Combined orgs + providers search |
 | `lib/supabase.ts` | Lazy server-side Supabase client |
 | `lib/types.ts` | Shared TS types |
 | `supabase/migrations/*.sql` | Schema (append-only, ordered) |
-| `supabase/seed.sql` | Demo org fixtures (NOT part of schema) |
+| `supabase/seed.sql` | Demo org + provider fixtures (NOT part of schema) |
+| `scripts/devin` | Auditable bash wrapper over the Devin v3 API (create/status/watch/list) |
 
 ## Running locally
 
@@ -150,5 +157,17 @@ committing a migration you still run `supabase db push` manually. Wiring that
 into CI (Supabase GitHub integration or a GitHub Action) is a future task. Until
 then, Supabase touches are limited to: schema pushes, seeds, and ad-hoc queries.
 
-Issues are tracked in **Linear** (CE 2.0 team); Devin can implement well-scoped
-issues; branches named `feat/CE-<n>-<slug>` auto-link to Linear.
+## Delegating to Devin
+
+Issues are tracked in **Linear** (CE 2.0 team). Devin is connected to Linear as
+an agent, so the normal flow is **Linear-native**: open an issue, press `A`, type
+`devin`, Enter. Devin starts a session (issue → In Progress), proposes a plan as
+a comment, implements on a branch, and opens a PR that auto-links back. Merging
+the PR moves the issue to Done automatically. Triggers: **assign/delegate to
+Devin**, **@devin** in a comment, or the **`devin` label**.
+
+For scripted/automated launches outside Linear there's also `scripts/devin`, a
+thin auditable wrapper over the **Devin v3 REST API** (reads `DEVIN_API_TOKEN` +
+`DEVIN_ORG_ID` from env): `scripts/devin create "<prompt>"`, `status <id>`,
+`watch <id>`, `list`. Prefer the Linear trigger for issue work so sessions and
+PRs auto-link; use the script for ad-hoc/automation cases.

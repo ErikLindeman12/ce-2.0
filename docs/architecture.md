@@ -24,7 +24,7 @@ metered per call.** That single flow tells the whole story.
 - **Organization** — a healthcare entity (hospital/system) with `capabilities`
   (channels it supports, data types it exchanges). *Built.*
 - **Provider** — an individual clinician (NPI, specialty) belonging to an org.
-  *Planned.*
+  *Built (CE-6): `providers` table, server-side specialty/capability search.*
 - **Location** — a physical site for an org/provider. *Planned.*
 - **Referral** — a request to send a patient + data to a target org/provider;
   has a status lifecycle and an event log. *Basic version built.*
@@ -55,7 +55,7 @@ are no separate services. A "component" below is a route group + a `lib/` module
 ### Components (current + planned)
 | Component | Lives in | Status |
 |-----------|----------|--------|
-| Directory | `app/api/organizations`, `lib/organizations.ts` (+ providers/locations) | partial |
+| Directory | `app/api/organizations` + `app/api/providers` + `app/api/directory`; `lib/organizations.ts`, `lib/providers.ts`, `lib/directory.ts` | orgs + providers built; locations planned |
 | Referrals | `app/api/referrals`, `lib/` routing + status | basic |
 | Auth | request middleware + `api_keys`/token logic in `lib/` | planned |
 | Metering | middleware that records a `usage_events` row per call | planned |

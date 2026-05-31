@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Thin, auditable wrapper over the official Devin v3 REST API (https://docs.devin.ai/api-reference).
+# No third-party code: just curl + your own token. Read it top to bottom — it's short on purpose.
+#
+# Setup (one time, done by you):
+#   1. Create a Devin API key (cog_…) in Devin settings, and note your organization id (org-…).
+#   2. export DEVIN_API_TOKEN=cog_xxx
+#      export DEVIN_ORG_ID=org-xxx           # add both to ~/.zshrc to persist
+#
+# Usage:
+#   scripts/devin create "Implement CE-6 ..."   # start a session, prints its id + url
+#   scripts/devin status <session_id>           # one-shot status + url (+ PR if present)
+#   scripts/devin watch  <session_id>           # poll status until it ends
+#   scripts/devin list                          # recent sessions
+
+set -euo pipefail
+
+BASE="${DEVIN_API_BASE:-https://api.devin.ai/v3}"
+
+die() { echo "error: $*" >&2; exit 1; }
+[ -n "${DEVIN_API_TOKEN:-}" ] || die "DEVIN_API_TOKEN is not set (see header of this file)."
+[ -n "${DEVIN_ORG_ID:-}" ]    || die "DEVIN_ORG_ID is not set (see header of this file)."
+
+ORG="/organizations/$DEVIN_ORG_ID"
+
+api() {
+  # api <METHOD> <path-under-org> [json-body]
+  local method="$1" path="$2" body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -fsS -X "$method" "$BASE$ORG$path" \
+      -H "Authorization: Bearer $DEVIN_API_TOKEN" \
+      -H "Content-Type: application/json" \
+      -d "$body"
+  else
+    curl -fsS -X "$method" "$BASE$ORG$path" \
+      -H "Authorization: Bearer $DEVIN_API_TOKEN"
+  fi
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  create)
+    [ $# -ge 1 ] || die 'usage: devin create "<prompt>"'
+    body=$(jq -n --arg p "$1" '{prompt: $p}')
+    api POST /sessions "$body" | jq '{session_id, url, status: (.status // "created")}'
+    ;;
+  status)
+    [ $# -eq 1 ] || die "usage: devin status <session_id>"
+    api GET "/sessions/$1" | jq '{status, status_detail, title, url, pull_requests}'
+    ;;
+  watch)
+    [ $# -eq 1 ] || die "usage: devin watch <session_id>"
+    while :; do
+      s=$(api GET "/sessions/$1" | jq -r '.status // "unknown"')
+      printf '%s  %s\n' "$(date +%H:%M:%S)" "$s"
+      case "$s" in exit|error|expired|finished|suspended) break ;; esac
+      sleep 15
+    done
+    ;;
+  list)
+    api GET "/sessions?limit=20" \
+      | jq '{total, items: ((.items // []) | map({session_id, status, title}))}'
+    ;;
+  *)
+    sed -n '2,15p' "$0"
+    ;;
+esac
