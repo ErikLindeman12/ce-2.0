@@ -86,6 +86,28 @@ notifications:manage   — configure notification preferences
 
 ---
 
+### 1a. Third-Party Apps & Delegation (OBO)
+
+**This is the core of the business model.** Third-party apps don't compete with the platform — they wrap it. Every call they make is metered, so the platform earns regardless of whose UI the user is looking at.
+
+**The mechanic (OAuth2 On-Behalf-Of / token delegation):**
+1. A third-party app (analytics vendor, patient wearable, scheduling tool) registers as a platform client and declares the scopes it needs.
+2. A user — provider, org admin, or patient — authorizes the app via OAuth and consents to those specific scopes.
+3. The app receives a **delegated token** that lets it call CE 2.0 APIs *as that user*, limited strictly to consented scopes.
+4. Every delegated call is metered and attributed to both the app and the user. The platform takes its cut.
+
+This is how Plaid (banking) and "Sign in with Google" work. The user-facing app owns the experience; the platform owns the rails.
+
+**Two delegation contexts:**
+- **Provider/org delegation** — e.g. an analytics vendor a health system already uses (Vizlytics-style) wraps the directory + referral APIs. The org consents; the vendor builds dashboards on top; every underlying API call is billed. The vendor competes on UX, the platform monetizes the data access.
+- **Patient delegation** — e.g. a consumer health app (Whoop, Apple Health) wants to pull a patient's referral or care-coordination data. The **patient** consents directly. With patient sign-off, the app gets a patient-scoped delegated token and can request what the patient authorized — nothing more.
+
+**Why this is Epic-positive:** the platform doesn't pick winners. Any app — Epic-built or third-party — gets the same delegated access. Epic monetizes the rails and still competes with its own first-party apps on merit. No app can access anything the consenting user couldn't already access themselves.
+
+**Consent** is the gate on all delegation. Detailed consent design (granularity, revocation, audit, patient-facing consent UI, data-use disclosures) is deferred to the **Data Exchange** phase — it matters most when actual clinical data starts flowing, vs. coordination metadata. For the PoC, delegation is modeled as scoped tokens; the consent ledger is a forward-looking concept noted here so the auth model is designed with it in mind from day one.
+
+---
+
 ### 2. Directory
 
 **What it is:** A searchable registry of every entity in the healthcare network — organizations, locations, providers, patients, and what each supports.
