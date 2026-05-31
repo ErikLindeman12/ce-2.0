@@ -2,7 +2,7 @@ import express, { Application } from 'express';
 import orgRouter from './routes/orgs';
 
 const app: Application = express();
-const PORT = 3001;
+const PORT = process.env.PORT ?? 3001;
 
 app.use(express.json());
 
