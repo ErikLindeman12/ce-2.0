@@ -14,6 +14,7 @@ INSERT INTO organizations (id, name, tenant_slug, endpoint_url, channels, data_t
 ON CONFLICT (id) DO NOTHING;
 
 -- Demo providers linked to the organizations above.
+-- NOTE: providers must be inserted before referral_requirements that reference them.
 INSERT INTO providers (id, org_id, name, npi, specialty) VALUES
   ('prov_chen',     'org_cleveland',  'Dr. Lisa Chen',         '1234567890', 'cardiology'),
   ('prov_garcia',   'org_mayo',       'Dr. Marco Garcia',      '2345678901', 'orthopedics'),
@@ -30,3 +31,33 @@ INSERT INTO providers (id, org_id, name, npi, specialty) VALUES
   ('prov_wilson',   'org_froedtert',  'Dr. Mark Wilson',       '3344556677', 'orthopedics'),
   ('prov_davis',    'org_aurora',     'Dr. Karen Davis',       '4455667788', 'neurology')
 ON CONFLICT (id) DO NOTHING;
+
+-- Referral requirements: org-level and provider-level custom configs.
+-- Orgs/providers without a row here get baseline fields only.
+
+-- Cleveland Clinic (org-level): requires insurance + makes clinical notes mandatory.
+INSERT INTO referral_requirements (org_id, provider_id, required_fields, custom_config) VALUES
+  ('org_cleveland', null,
+   '[
+     {"key":"clinicalNotes","label":"Clinical notes","type":"textarea","required":true},
+     {"key":"insurancePolicyNumber","label":"Insurance policy number","type":"text","required":true},
+     {"key":"priorAuthNumber","label":"Prior authorization number","type":"text","required":false}
+   ]'::jsonb,
+   '{"noteFormat":"SOAP"}'::jsonb),
+
+-- UCSF (org-level): adds contact preference + imaging checkbox.
+  ('org_ucsf', null,
+   '[
+     {"key":"preferredContactMethod","label":"Preferred contact method","type":"select","required":true,"options":["phone","fax","portal"]},
+     {"key":"imagingResultsAttached","label":"Prior imaging attached?","type":"boolean","required":true}
+   ]'::jsonb,
+   '{}'::jsonb),
+
+-- Dr. Lisa Chen (provider-level): requires prior imaging results on top of Cleveland's org config.
+  (null, 'prov_chen',
+   '[
+     {"key":"priorImagingResults","label":"Prior imaging results","type":"textarea","required":true}
+   ]'::jsonb,
+   '{"preferredReferralWindow":"2 weeks"}'::jsonb)
+
+ON CONFLICT DO NOTHING;

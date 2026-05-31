@@ -40,6 +40,48 @@ export interface DirectoryFilters {
   state?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Referral instructions — per-org / per-provider required fields
+// ---------------------------------------------------------------------------
+
+export type ReferralFieldType = 'text' | 'date' | 'select' | 'boolean' | 'textarea';
+
+export interface ReferralField {
+  key: string;
+  label: string;
+  type: ReferralFieldType;
+  required: boolean;
+  options?: string[];
+}
+
+export interface ReferralInstructionsTarget {
+  orgId: string | null;
+  orgName: string | null;
+  providerId: string | null;
+  providerName: string | null;
+}
+
+export interface ReferralInstructions {
+  target: ReferralInstructionsTarget;
+  fields: ReferralField[];
+  customConfig: Record<string, unknown>;
+}
+
+export const BASELINE_FIELDS: ReferralField[] = [
+  { key: 'patient.firstName', label: 'First name', type: 'text', required: true },
+  { key: 'patient.lastName', label: 'Last name', type: 'text', required: true },
+  { key: 'patient.dateOfBirth', label: 'Date of birth', type: 'date', required: true },
+  { key: 'referringProvider.npi', label: 'Referring provider NPI', type: 'text', required: true },
+  { key: 'procedure', label: 'Procedure / data type', type: 'text', required: true },
+  { key: 'priority', label: 'Priority', type: 'select', required: true, options: ['routine', 'urgent', 'stat'] },
+  { key: 'clinicalNotes', label: 'Clinical notes', type: 'textarea', required: false },
+];
+
+// ---------------------------------------------------------------------------
+// Send referral payload
+// ---------------------------------------------------------------------------
+
+
 export interface SendReferralPayload {
   toOrgId: string;
   toOrgName: string;
