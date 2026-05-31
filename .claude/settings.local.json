@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__Claude_in_Chrome__tabs_context_mcp",
+      "Bash(gh auth *)",
+      "Bash(gh api *)",
+      "Bash(git config *)",
+      "mcp__Claude_in_Chrome__navigate",
+      "mcp__Claude_in_Chrome__find",
+      "Bash(brew --version)",
+      "Bash(brew install *)",
+      "Bash(git init *)",
+      "Bash(git remote *)",
+      "mcp__3d286d3c-e95b-4bb6-a985-3c2936baa770__list_teams",
+      "mcp__3d286d3c-e95b-4bb6-a985-3c2936baa770__list_issue_statuses"
+    ]
+  }
+}
