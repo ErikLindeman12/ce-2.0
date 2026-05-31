@@ -2,11 +2,14 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { searchProviders } from '@/lib/providers';
 
 export async function GET(req: NextRequest) {
-  const specialty = req.nextUrl.searchParams.get('specialty') ?? undefined;
-  const orgId = req.nextUrl.searchParams.get('org_id') ?? undefined;
-  const query = req.nextUrl.searchParams.get('q') ?? undefined;
-
+  const params = req.nextUrl.searchParams;
   return NextResponse.json({
-    data: await searchProviders({ query, specialty, orgId }),
+    data: await searchProviders({
+      q: params.get('q') ?? undefined,
+      specialty: params.get('specialty') ?? undefined,
+      orgId: params.get('org_id') ?? undefined,
+      city: params.get('city') ?? undefined,
+      state: params.get('state') ?? undefined,
+    }),
   });
 }

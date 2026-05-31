@@ -11,6 +11,10 @@ export interface Org {
   tenantSlug: string;
   endpointUrl: string;
   capabilities: OrgCapabilities;
+  specialties: string[];
+  city: string | null;
+  state: string | null;
+  zip: string | null;
   active: boolean;
 }
 
@@ -26,6 +30,14 @@ export interface Provider {
 export interface DirectorySearchResult {
   organizations: Org[];
   providers: Provider[];
+}
+
+/** Shared filter options for directory search. All optional + composable. */
+export interface DirectoryFilters {
+  q?: string;
+  specialty?: string;
+  city?: string;
+  state?: string;
 }
 
 export interface SendReferralPayload {
