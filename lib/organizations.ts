@@ -1,65 +1,43 @@
-import type { Org } from './types';
+import { getSupabase } from './supabase';
+import type { Org, OrgChannel } from './types';
 
-// Temporary in-memory directory. Swap this module's internals for a Supabase
-// query later — the route handler that calls searchOrgs() won't change.
-const ORGS: Org[] = [
-  {
-    id: 'org_mayo',
-    name: 'Mayo Clinic',
-    tenantSlug: 'mayo-clinic',
-    endpointUrl: 'https://api.mayo-clinic.ce2.local',
-    capabilities: { channels: ['cloud', 'direct'], dataTypes: ['labs', 'meds', 'imaging'] },
-    active: true,
-  },
-  {
-    id: 'org_mgh',
-    name: 'Mass General',
-    tenantSlug: 'mass-general',
-    endpointUrl: 'https://api.mass-general.ce2.local',
-    capabilities: { channels: ['cloud', 'fax', 'direct'], dataTypes: ['labs', 'meds', 'notes'] },
-    active: true,
-  },
-  {
-    id: 'org_cleveland',
-    name: 'Cleveland Clinic',
-    tenantSlug: 'cleveland-clinic',
-    endpointUrl: 'https://api.cleveland-clinic.ce2.local',
-    capabilities: { channels: ['cloud'], dataTypes: ['labs', 'imaging', 'notes', 'cardiology'] },
-    active: true,
-  },
-  {
-    id: 'org_jhh',
-    name: 'Johns Hopkins Hospital',
-    tenantSlug: 'johns-hopkins',
-    endpointUrl: 'https://api.johns-hopkins.ce2.local',
-    capabilities: { channels: ['cloud', 'direct'], dataTypes: ['labs', 'meds', 'imaging', 'oncology'] },
-    active: true,
-  },
-  {
-    id: 'org_kaiser',
-    name: 'Kaiser Permanente',
-    tenantSlug: 'kaiser-permanente',
-    endpointUrl: 'https://api.kaiser.ce2.local',
-    capabilities: { channels: ['cloud', 'portal'], dataTypes: ['labs', 'meds', 'notes', 'primary-care'] },
-    active: true,
-  },
-  {
-    id: 'org_ucsf',
-    name: 'UCSF Medical Center',
-    tenantSlug: 'ucsf',
-    endpointUrl: 'https://api.ucsf.ce2.local',
-    capabilities: { channels: ['cloud', 'direct', 'fax'], dataTypes: ['labs', 'imaging', 'neurology'] },
-    active: true,
-  },
-];
+interface OrgRow {
+  id: string;
+  name: string;
+  tenant_slug: string;
+  endpoint_url: string;
+  channels: string[];
+  data_types: string[];
+  active: boolean;
+}
 
-export function searchOrgs(query: string): Org[] {
+function toOrg(r: OrgRow): Org {
+  return {
+    id: r.id,
+    name: r.name,
+    tenantSlug: r.tenant_slug,
+    endpointUrl: r.endpoint_url,
+    capabilities: { channels: r.channels as OrgChannel[], dataTypes: r.data_types },
+    active: r.active,
+  };
+}
+
+export async function searchOrgs(query: string): Promise<Org[]> {
+  const { data, error } = await getSupabase()
+    .from('organizations')
+    .select('id,name,tenant_slug,endpoint_url,channels,data_types,active')
+    .eq('active', true);
+
+  if (error) throw new Error(`organizations query failed: ${error.message}`);
+
+  const orgs = (data as OrgRow[]).map(toOrg);
+
   const q = query.trim().toLowerCase();
-  if (!q) return ORGS;
-  return ORGS.filter(
-    (org) =>
-      org.name.toLowerCase().includes(q) ||
-      org.tenantSlug.toLowerCase().includes(q) ||
-      org.capabilities.dataTypes.some((d) => d.toLowerCase().includes(q)),
+  if (!q) return orgs;
+  return orgs.filter(
+    (o) =>
+      o.name.toLowerCase().includes(q) ||
+      o.tenantSlug.toLowerCase().includes(q) ||
+      o.capabilities.dataTypes.some((d) => d.toLowerCase().includes(q)),
   );
 }

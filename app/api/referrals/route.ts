@@ -1,4 +1,5 @@
 import { NextResponse, type NextRequest } from 'next/server';
+import { getSupabase } from '@/lib/supabase';
 import type { SendReferralPayload } from '@/lib/types';
 
 export async function POST(req: NextRequest) {
@@ -13,14 +14,26 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Missing toOrgId' }, { status: 400 });
   }
 
-  const referralId = crypto.randomUUID();
+  const { data, error } = await getSupabase()
+    .from('referrals')
+    .insert({
+      to_org_id: payload.toOrgId,
+      to_org_name: payload.toOrgName,
+      patient: payload.patient,
+      request: payload.request,
+    })
+    .select('id')
+    .single();
 
-  // For now we just log. These lines land in Vercel's runtime logs
-  // (dashboard > project > Logs, or `vercel logs`). Later: persist to Supabase.
+  if (error) {
+    console.error('[referral.insert_failed]', error.message);
+    return NextResponse.json({ error: 'Failed to save referral' }, { status: 500 });
+  }
+
   console.log(
     '[referral.received]',
-    JSON.stringify({ referralId, receivedAt: new Date().toISOString(), ...payload }),
+    JSON.stringify({ referralId: data.id, receivedAt: new Date().toISOString(), ...payload }),
   );
 
-  return NextResponse.json({ status: 'accepted', referralId }, { status: 202 });
+  return NextResponse.json({ status: 'accepted', referralId: data.id }, { status: 202 });
 }
