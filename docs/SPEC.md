@@ -179,6 +179,50 @@ GET    /referrals/:id/events   — full event log
 
 ---
 
+### 3a. Data Exchange — External Retrieval (IAS / TEFCA / FHIR)
+
+**What it is:** CE 2.0 acts as an **Individual Access Services (IAS) provider** under TEFCA. With a patient's consent, the platform queries *other* systems across the national network (QHINs) and via direct FHIR endpoints, pulls that patient's records in, aggregates them into a unified longitudinal record, and makes it accessible via API / MCP.
+
+This is the inverse of the OBO model in §1a:
+- **§1a (outbound from us):** a third-party app pulls data *from* CE 2.0 on behalf of a consented user.
+- **§3a (inbound to us):** CE 2.0 pulls data *from external systems* on behalf of a consented patient. The platform is the requesting party.
+
+Both directions are patient/user-mediated and metered. Together they make CE 2.0 the aggregation + agent-access hub.
+
+**Why this is the most defensible feature for the leadership pitch:** IAS is the patient's HIPAA Right of Access, exercised on their behalf. CE 2.0 exposes nothing it isn't entitled to — it retrieves the patient's *own* data that the patient is legally entitled to, from across the network. Patient-mediated retrieval, USCDI-scoped. This is squarely inside the "don't expose more than already gettable" line.
+
+**The flow:**
+1. **Patient consent + identity proofing** — patient authorizes CE 2.0 as their IAS app. (TEFCA IAS requires identity verification / IAL2-style proofing. For PoC: mock the proofing, model the consent record.)
+2. **Network query** — CE 2.0 fans out a patient-match + record-retrieval request across connected QHINs and any directly-registered FHIR endpoints.
+3. **Aggregate + normalize** — responses (FHIR R4 USCDI resources) are merged into a unified patient record, de-duplicated across sources.
+4. **Surface** — the aggregated record is queryable via API and exposed through the MCP, so a patient's or provider's agent can ask "show me everything across every system this patient has been seen at."
+
+**Key endpoints:**
+```
+POST /patients/:id/retrieval        — initiate a network pull (requires patient-consented token)
+GET  /patients/:id/retrieval/:jobId — status of an in-flight retrieval (fan-out is async)
+GET  /patients/:id/record           — aggregated longitudinal record (USCDI resources)
+GET  /patients/:id/record/sources   — which systems/QHINs contributed, with timestamps
+GET  /patients/:id/consents         — active consents authorizing retrieval
+```
+
+**Connectors (pluggable):**
+- `tefca` — query via a QHIN connection (mock for PoC: simulated QHIN returning FHIR bundles)
+- `fhir` — direct FHIR R4 endpoint query (real, against any standard FHIR server / sandbox)
+- Designed so new exchange networks (CommonWell, Carequality, regional HIEs) plug in as additional connectors behind the same retrieval API.
+
+**Scopes:**
+```
+records:read       — read the aggregated patient record
+records:retrieve   — initiate a network pull (high-trust; patient-consented only)
+```
+
+**Relationship to consent:** this module is where the consent ledger (deferred from §1a) becomes load-bearing — a retrieval is only legal with a valid, current patient consent on file. Full consent design (granularity, revocation, audit trail, patient-facing consent UI) lands with this module in the Data Exchange phase.
+
+**MCP unlock:** add `retrieve_patient_record(patientId)` and `get_patient_record(patientId)` MCP tools. The agent demo becomes: patient consents → "pull my records from everywhere" → CE 2.0 fans out across the network → agent summarizes the patient's complete longitudinal history. That single flow demonstrates the entire platform thesis.
+
+---
+
 ### 4. Notifications
 
 **What it is:** The delivery layer for referral events. When a referral status changes, interested parties are notified via their preferred channel.
