@@ -1,7 +1,9 @@
 # CE 2.0 — Claude Code Context
 
-> **How to run, test, and deploy this repo:** see [docs/repo-guide.md](docs/repo-guide.md).
-> Read it first for architecture, local dev, the Supabase workflow, and deploys.
+> **Start here:**
+> - [docs/architecture.md](docs/architecture.md) — vision, domain model, and the invariants every change must obey.
+> - [docs/repo-guide.md](docs/repo-guide.md) — how to run, test, and deploy; the Supabase workflow.
+> - [docs/devin-issue-template.md](docs/devin-issue-template.md) — the format every implementation issue follows.
 
 ## What this is
 Cloud + agent-native interoperability platform — data exchange and workflow orchestration across systems and AI agents.
