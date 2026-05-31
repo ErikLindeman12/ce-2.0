@@ -14,6 +14,20 @@ export interface Org {
   active: boolean;
 }
 
+export interface Provider {
+  id: string;
+  orgId: string;
+  name: string;
+  npi: string;
+  specialty: string;
+  active: boolean;
+}
+
+export interface DirectorySearchResult {
+  organizations: Org[];
+  providers: Provider[];
+}
+
 export interface SendReferralPayload {
   toOrgId: string;
   toOrgName: string;
