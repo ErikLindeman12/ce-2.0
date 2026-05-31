@@ -28,6 +28,8 @@ export interface DirectorySearchResult {
   providers: Provider[];
 }
 
+export type ReferralStatus = 'sent' | 'dispatch_failed' | 'queued';
+
 export interface SendReferralPayload {
   toOrgId: string;
   toOrgName: string;
@@ -41,4 +43,14 @@ export interface SendReferralPayload {
     priority: 'routine' | 'urgent' | 'stat';
     notes?: string;
   };
+  referringProviderNpi?: string;
+  clinicalNotes?: string;
+  notifyEmail?: string;
+  notifyPhone?: string;
+}
+
+export interface SendReferralResult {
+  referralId: string;
+  status: ReferralStatus;
+  dispatchStatus: ReferralStatus;
 }
