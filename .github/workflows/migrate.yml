@@ -1,0 +1,36 @@
+name: Supabase migrations
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'supabase/migrations/**'
+  workflow_dispatch:
+    inputs:
+      run_seed:
+        description: 'Also run seed.sql (safe to re-run; orgs+providers are idempotent)'
+        type: boolean
+        default: false
+
+jobs:
+  migrate:
+    name: Apply migrations
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      PROJECT_REF: mmvjptmuazcamuduhyzz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Push migrations
+        run: supabase db push --project-ref $PROJECT_REF
+
+      - name: Run seed
+        if: github.event_name == 'workflow_dispatch' && inputs.run_seed == true
+        run: supabase db query --project-ref $PROJECT_REF -f supabase/seed.sql
