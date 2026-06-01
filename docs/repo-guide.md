@@ -1,7 +1,7 @@
 # CE 2.0 — Repo Guide
 
 How this repo is wired and how to run, test, and deploy it. This is the
-operational companion to the product vision in [CLAUDE.md](../CLAUDE.md).
+operational companion to the product vision in [AGENTS.md](../AGENTS.md) / [CLAUDE.md](../CLAUDE.md).
 
 ## What's actually built today
 
