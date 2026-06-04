@@ -78,9 +78,20 @@ export const BASELINE_FIELDS: ReferralField[] = [
 ];
 
 // ---------------------------------------------------------------------------
-// Send referral payload
+// User ↔ org membership
 // ---------------------------------------------------------------------------
 
+export interface OrgUser {
+  id: string;
+  userId: string;
+  orgId: string;
+  role: 'referrer' | 'referee';
+  createdAt: string;
+}
+
+// ---------------------------------------------------------------------------
+// Send referral payload
+// ---------------------------------------------------------------------------
 
 export interface SendReferralPayload {
   toOrgId: string;

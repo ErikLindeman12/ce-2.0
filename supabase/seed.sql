@@ -15,6 +15,11 @@ ON CONFLICT (id) DO NOTHING;
 
 -- Demo providers linked to the organizations above.
 -- NOTE: providers must be inserted before referral_requirements that reference them.
+-- Note: org_users rows require a real auth.users UUID. After creating a user
+-- via the portal sign-up form, insert their association manually:
+--   insert into org_users (user_id, org_id, role)
+--   values ('<auth-user-uuid>', 'org_mayo', 'referrer');
+
 INSERT INTO providers (id, org_id, name, npi, specialty) VALUES
   ('prov_chen',     'org_cleveland',  'Dr. Lisa Chen',         '1234567890', 'cardiology'),
   ('prov_garcia',   'org_mayo',       'Dr. Marco Garcia',      '2345678901', 'orthopedics'),
