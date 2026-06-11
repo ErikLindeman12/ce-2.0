@@ -3,6 +3,7 @@
 > **Start here:**
 > - [docs/architecture.md](docs/architecture.md) — vision, domain model, and the invariants every change must obey.
 > - [docs/feature-map.md](docs/feature-map.md) — how each Linear issue fits into the platform flows; the two user groups; dependency map.
+> - [docs/platform-model.md](docs/platform-model.md) — the forward design model: channels, fax, events/subscriptions, patient-mediated referral; what's PoC vs. deferred.
 > - [docs/repo-guide.md](docs/repo-guide.md) — how to run, test, and deploy; the Supabase workflow.
 > - [docs/devin-issue-template.md](docs/devin-issue-template.md) — the format every implementation issue follows.
 
