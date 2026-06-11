@@ -51,6 +51,34 @@ The most polished path; lead the demo with it.
 
 ---
 
+## ⭐ Workflow 2 showcase — Inbound intake + the review workbench
+
+1. **The account toggle** (top-right): you're "Epic Health System · Network
+   Console." Switching to "Provider portal as → Cleveland Clinic" turns the
+   whole app into *their* teal-chrome inbox — this is how you show both sides
+   of the network without confusion. Console routes are blocked while acting
+   as a provider.
+2. **"☀️ Morning batch (8)"** on the Queues board + auto-tick ON: eight mixed
+   communications (faxes, a DM, a phone call, a garbled fax, a misspelled
+   name) arrive at once and the board drains itself. The **stats strip**
+   updates live: auto-routed % vs escalated — the supervision-surface story
+   in one number.
+3. **Phone is just another channel**: "📞 Call: referral" injects a call
+   transcript with an auto-transcribed CALL SUMMARY; same pipeline, routed to
+   Referrals; the item renders with a CALL header instead of FAX.
+4. **The review workbench** (open anything in Human Review):
+   - The *misspelled-name fax* ("Jame Whitfield"): blocking question
+     "Closest MPI match is James Whitfield… is this the right patient?" with
+     the candidate card — one click routes it.
+   - The *garbled fax*: source document left, **editable extraction form**
+     right with per-field confidence chips; extraction's source lines are
+     highlighted in the document (hover a field → its line lights up). Type
+     the correct name + DOB, **Confirm & route** — the platform re-matches
+     the patient automatically and the audit log records exactly which
+     fields the human corrected.
+
+---
+
 ## Setup (run once before the demo)
 
 ```bash

@@ -83,22 +83,38 @@ export async function getWorkItem(id: string): Promise<WorkItemDetail | null> {
 
   const wi = item as unknown as WorkItem;
 
-  // If in human_review with an ambiguous match question, fetch candidates
+  // If in human_review with a patient-match question, fetch candidates.
+  // Covers two cases:
+  //   - Ambiguous (two named patients): review_reason includes "patients named"
+  //   - Fuzzy single-candidate: review_reason starts with "Closest MPI match is"
   let patientCandidates: Patient[] | undefined;
-  if (
-    wi.queue_key === 'human_review' &&
-    wi.review_reason?.includes('patients named')
-  ) {
+  if (wi.queue_key === 'human_review' && wi.review_reason) {
     const extracted = wi.extracted_data as Record<string, string>;
-    const firstName = extracted['patient_first_name'] ?? '';
-    const lastName = extracted['patient_last_name'] ?? '';
-    if (firstName && lastName) {
-      const { data: candidates } = await sb
-        .from('patients')
-        .select('*')
-        .ilike('first_name', firstName)
-        .ilike('last_name', lastName);
-      patientCandidates = (candidates ?? []) as Patient[];
+
+    if (wi.review_reason.includes('patients named')) {
+      // Ambiguous: exact name match — may return 2+ candidates
+      const firstName = extracted['patient_first_name'] ?? '';
+      const lastName = extracted['patient_last_name'] ?? '';
+      if (firstName && lastName) {
+        const { data: candidates } = await sb
+          .from('patients')
+          .select('*')
+          .ilike('first_name', firstName)
+          .ilike('last_name', lastName);
+        patientCandidates = (candidates ?? []) as Patient[];
+      }
+    } else if (wi.review_reason.startsWith('Closest MPI match is')) {
+      // Fuzzy single-candidate: use loosened first-3-chars + exact last name
+      const firstName = extracted['patient_first_name'] ?? '';
+      const lastName = extracted['patient_last_name'] ?? '';
+      if (firstName.length >= 3 && lastName) {
+        const { data: candidates } = await sb
+          .from('patients')
+          .select('*')
+          .ilike('first_name', firstName.slice(0, 3) + '%')
+          .ilike('last_name', lastName);
+        patientCandidates = (candidates ?? []) as Patient[];
+      }
     }
   }
 

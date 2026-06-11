@@ -6,20 +6,7 @@
  */
 
 import { getSupabase } from './supabase';
-// handleAttemptResponse is exported from lib/simulate by the outbound-engine teammate.
-// The function exists in the file but is not yet exported — cast through unknown until
-// the export is wired up. This compiles and will work at runtime.
-import * as simulateModule from './simulate';
-const handleAttemptResponse = (
-  simulateModule as unknown as {
-    handleAttemptResponse: (
-      workItemId: string,
-      queueKey: string,
-      response: Record<string, unknown>,
-      existingExtracted: Record<string, unknown>,
-    ) => Promise<void>;
-  }
-).handleAttemptResponse;
+import { handleAttemptResponse } from './simulate';
 
 // ---------------------------------------------------------------------------
 // Types

@@ -43,12 +43,31 @@ function classifyHeuristic(text: string): { type: string; confidence: number } {
   return { type: 'unknown', confidence: 0.3 };
 }
 
-/** Extract labeled fields from text */
+/** Per-field metadata shape stored in agent_state.extraction_meta */
+export interface ExtractionFieldMeta {
+  confidence: number;
+  sourceLine: number;
+}
+
+export interface ExtractionMeta {
+  fields: Record<string, ExtractionFieldMeta>;
+}
+
+/** Extract labeled fields from text, also computing per-field extraction_meta */
 function extractHeuristic(text: string): {
   fields: Record<string, string>;
   confidence: number;
+  extraction_meta: ExtractionMeta;
 } {
   const fields: Record<string, string> = {};
+  const metaFields: Record<string, ExtractionFieldMeta> = {};
+  const lines = text.split('\n');
+
+  /** Find 0-based line index for a value in a specific field */
+  function sourceLine(value: string): number {
+    const idx = lines.findIndex((l) => l.includes(value));
+    return idx >= 0 ? idx : 0;
+  }
 
   // Try JSON-ish DM format first
   const jsonPatientMatch = /"first_name"\s*:\s*"([^"]+)"/.exec(text);
@@ -62,21 +81,28 @@ function extractHeuristic(text: string): {
     const returnChannel = (/"return_channel"\s*:\s*"([^"]+)"/.exec(text) ?? [])[1] ?? '';
     const returnAddress = (/"return_address"\s*:\s*"([^"]+)"/.exec(text) ?? [])[1] ?? '';
 
-    if (firstName) fields['patient_first_name'] = firstName;
-    if (lastName) fields['patient_last_name'] = lastName;
-    if (dob) fields['patient_dob'] = dob;
-    if (mrn) fields['patient_mrn'] = mrn;
-    if (recordsReq) fields['records_requested'] = recordsReq;
-    if (auth) fields['authorization'] = auth;
-    if (returnChannel) fields['return_channel'] = returnChannel;
-    if (returnAddress) fields['return_address'] = returnAddress;
+    // JSON-ish DM fields get confidence 0.97
+    if (firstName) { fields['patient_first_name'] = firstName; metaFields['patient_first_name'] = { confidence: 0.97, sourceLine: sourceLine(firstName) }; }
+    if (lastName)  { fields['patient_last_name']  = lastName;  metaFields['patient_last_name']  = { confidence: 0.97, sourceLine: sourceLine(lastName) }; }
+    if (dob)       { fields['patient_dob']         = dob;       metaFields['patient_dob']         = { confidence: 0.97, sourceLine: sourceLine(dob) }; }
+    if (mrn)       { fields['patient_mrn']         = mrn;       metaFields['patient_mrn']         = { confidence: 0.97, sourceLine: sourceLine(mrn) }; }
+    if (recordsReq){ fields['records_requested']   = recordsReq; metaFields['records_requested']  = { confidence: 0.97, sourceLine: sourceLine(recordsReq) }; }
+    if (auth)      { fields['authorization']       = auth;      metaFields['authorization']       = { confidence: 0.97, sourceLine: sourceLine(auth) }; }
+    if (returnChannel){ fields['return_channel']   = returnChannel; metaFields['return_channel']  = { confidence: 0.97, sourceLine: sourceLine(returnChannel) }; }
+    if (returnAddress){ fields['return_address']   = returnAddress; metaFields['return_address']  = { confidence: 0.97, sourceLine: sourceLine(returnAddress) }; }
 
     const found = Object.keys(fields).length;
     const confidence = Math.min(0.97, 0.7 + found * 0.04);
-    return { fields, confidence };
+    return { fields, confidence, extraction_meta: { fields: metaFields } };
   }
 
-  // Labeled-line format
+  // CALL SUMMARY block — lines from a structured phone artifact get 0.9
+  const inCallSummary = (lineIdx: number): boolean => {
+    const summaryStart = lines.findIndex((l) => /CALL SUMMARY/.test(l));
+    return summaryStart >= 0 && lineIdx > summaryStart;
+  };
+
+  // Labeled-line format (covers both fax labeled lines and CALL SUMMARY lines)
   const labeledPatterns: Array<[string, RegExp]> = [
     ['patient_name', /^Patient:\s*(.+)$/im],
     ['patient_dob', /^DOB:\s*(.+)$/im],
@@ -88,6 +114,8 @@ function extractHeuristic(text: string): {
     ['records_requested', /^Records Requested:\s*(.+)$/im],
     ['authorization', /^Authorization:\s*(.+)$/im],
     ['requesting_provider', /^Requesting Provider:\s*(.+)$/im],
+    ['caller', /^Caller:\s*(.+)$/im],
+    ['callback', /^Callback:\s*(.+)$/im],
   ];
 
   let found = 0;
@@ -96,25 +124,39 @@ function extractHeuristic(text: string): {
     if (m) {
       fields[key] = m[1].trim();
       found++;
+      const lineIdx = sourceLine(m[1].trim());
+      const conf = inCallSummary(lineIdx) ? 0.9 : 0.95;
+      metaFields[key] = { confidence: conf, sourceLine: lineIdx };
     }
   }
 
-  // Split patient_name into first/last
+  // Split patient_name into first/last (inferred split → 0.6)
   if (fields['patient_name']) {
     const parts = fields['patient_name'].split(/\s+/);
     if (parts.length >= 2) {
+      const firstLine = metaFields['patient_name']?.sourceLine ?? 0;
+      const isCallLine = inCallSummary(firstLine);
+      const splitConf = isCallLine ? 0.9 : 0.6;
       fields['patient_first_name'] = parts[0];
       fields['patient_last_name'] = parts.slice(1).join(' ');
+      metaFields['patient_first_name'] = { confidence: splitConf, sourceLine: firstLine };
+      metaFields['patient_last_name']  = { confidence: splitConf, sourceLine: firstLine };
     }
   }
 
   if (found === 0) {
     // Messy — no labels found
-    return { fields, confidence: 0.15 };
+    return { fields, confidence: 0.15, extraction_meta: { fields: metaFields } };
   }
 
-  const confidence = Math.min(0.9, 0.4 + found * 0.09);
-  return { fields, confidence };
+  let confidence = Math.min(0.9, 0.4 + found * 0.09);
+  // A CALL SUMMARY block is machine-transcribed structure — fewer fields than
+  // a full fax form, but each one reliable. Floor the overall score so clean
+  // call artifacts clear the default 0.8 gate while messy text never does.
+  if (found >= 3 && /CALL SUMMARY/.test(text)) {
+    confidence = Math.max(confidence, 0.86);
+  }
+  return { fields, confidence, extraction_meta: { fields: metaFields } };
 }
 
 /** Match a patient by name+DOB against the MPI */
@@ -165,6 +207,25 @@ async function matchPatientHeuristic(
   const patients = data as Patient[];
 
   if (patients.length === 0) {
+    // Fuzzy retry: loosen first name to first 3 chars, keep exact last name
+    if (firstName.length >= 3 && lastName) {
+      const fuzzyFirst = firstName.slice(0, 3) + '%';
+      const { data: fuzzyData } = await sb
+        .from('patients')
+        .select('*')
+        .ilike('first_name', fuzzyFirst)
+        .ilike('last_name', lastName);
+      const fuzzyPatients = (fuzzyData ?? []) as Patient[];
+      if (fuzzyPatients.length === 1) {
+        const p = fuzzyPatients[0];
+        return {
+          patientId: null,
+          candidates: fuzzyPatients,
+          confidence: 0.6,
+          question: `Closest MPI match is ${p.first_name} ${p.last_name} (DOB ${p.dob}, MRN ${p.mrn}) — is this the right patient?`,
+        };
+      }
+    }
     return {
       patientId: null,
       candidates: [],
@@ -232,10 +293,10 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
 
     // Step 2: extract
     if (!alreadyDone.has('extract_fields')) {
-      const { fields, confidence } = extractHeuristic(text);
+      const { fields, confidence, extraction_meta } = extractHeuristic(text);
       return {
         action: 'extract_fields',
-        params: { fields },
+        params: { fields, extraction_meta },
         confidence,
         rationale: `Heuristic extraction: found ${Object.keys(fields).length} fields (confidence ${confidence.toFixed(2)})`,
       };

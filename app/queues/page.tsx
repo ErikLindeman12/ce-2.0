@@ -29,6 +29,26 @@ function themeFor(key: string): QueueTheme {
 }
 
 // ---------------------------------------------------------------------------
+// Intake stats shape
+// ---------------------------------------------------------------------------
+
+interface IntakeStats {
+  processed: number;
+  autoRouted: number;
+  escalated: number;
+  resolvedByHuman: number;
+  avgClassify?: number;
+  avgExtract?: number;
+  avgMatch?: number;
+  byChannel: {
+    fax?: number;
+    direct_message?: number;
+    phone?: number;
+    portal?: number;
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
 
@@ -39,7 +59,78 @@ const SCENARIOS: Array<{ key: string; label: string }> = [
   { key: 'fax_messy',             label: 'Fax: Messy / garbled OCR' },
   { key: 'dm_records_request',    label: 'DM: Records request' },
   { key: 'fax_roi_missing_auth',  label: 'Fax: ROI missing auth' },
+  { key: 'call_referral',         label: '📞 Call: referral' },
+  { key: 'call_records_request',  label: '📞 Call: records request' },
+  { key: 'fax_referral_partial',  label: 'Fax: partial/fuzzy match' },
 ];
+
+// ---------------------------------------------------------------------------
+// Stats strip
+// ---------------------------------------------------------------------------
+
+function IntakeStatsStrip({ stats }: { stats: IntakeStats }) {
+  const autoRoutedPct = stats.processed > 0
+    ? Math.round((stats.autoRouted / stats.processed) * 100)
+    : 0;
+
+  return (
+    <div className="intake-stats-strip">
+      <div className="intake-stat-item">
+        <div className="intake-stat-label">Processed</div>
+        <div className="intake-stat-value">{stats.processed}</div>
+      </div>
+      <div className="intake-stat-divider" />
+      <div className="intake-stat-item">
+        <div className="intake-stat-label">Auto-routed</div>
+        <div className="intake-stat-value" style={{ color: 'var(--color-success)' }}>
+          {stats.autoRouted}
+          {stats.processed > 0 && (
+            <span className="intake-stat-pct badge badge-success" style={{ marginLeft: '6px' }}>
+              {autoRoutedPct}%
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="intake-stat-divider" />
+      <div className="intake-stat-item">
+        <div className="intake-stat-label">Escalated</div>
+        <div className="intake-stat-value" style={{ color: 'var(--color-warning)' }}>
+          {stats.escalated}
+        </div>
+      </div>
+      <div className="intake-stat-divider" />
+      <div className="intake-stat-item">
+        <div className="intake-stat-label">Resolved by humans</div>
+        <div className="intake-stat-value">{stats.resolvedByHuman}</div>
+      </div>
+      <div className="intake-stat-divider" />
+      {/* Per-channel counts */}
+      <div className="intake-stat-item">
+        <div className="intake-stat-label">By channel</div>
+        <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', marginTop: '2px' }}>
+          {(stats.byChannel.fax ?? 0) > 0 && (
+            <span style={{ fontSize: '0.82rem', display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+              📠 <strong>{stats.byChannel.fax}</strong>
+            </span>
+          )}
+          {(stats.byChannel.direct_message ?? 0) > 0 && (
+            <span style={{ fontSize: '0.82rem', display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+              ✉️ <strong>{stats.byChannel.direct_message}</strong>
+            </span>
+          )}
+          {(stats.byChannel.phone ?? 0) > 0 && (
+            <span style={{ fontSize: '0.82rem', display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+              📞 <strong>{stats.byChannel.phone}</strong>
+            </span>
+          )}
+          {Object.values(stats.byChannel).every((v) => !v || v === 0) && (
+            <span style={{ color: 'var(--color-ink-faint)', fontSize: '0.80rem' }}>—</span>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Actor badge
@@ -87,7 +178,11 @@ export default function QueuesPage() {
   const [activity, setActivity] = useState<AuditLogEntry[]>([]);
   const [activityStale, setActivityStale] = useState(false);
 
+  const [intakeStats, setIntakeStats] = useState<IntakeStats | null>(null);
+  const [statsError, setStatsError] = useState(false);
+
   const [simLoading, setSimLoading] = useState<string | null>(null);
+  const [simFeedback, setSimFeedback] = useState<string | null>(null);
   const [tickLoading, setTickLoading] = useState(false);
   const [autoTick, setAutoTick] = useState(false);
   const [tickEvents, setTickEvents] = useState<TickEvent[]>([]);
@@ -114,10 +209,28 @@ export default function QueuesPage() {
     } catch { setActivityStale(true); }
   }
 
+  async function fetchIntakeStats() {
+    try {
+      const res = await fetch('/api/stats/intake', { cache: 'no-store' });
+      if (!res.ok) throw new Error('non-ok');
+      const body = (await res.json()) as { data?: IntakeStats } | IntakeStats;
+      const data = ('data' in body && body.data) ? body.data : body as IntakeStats;
+      setIntakeStats(data);
+      setStatsError(false);
+    } catch {
+      setStatsError(true);
+    }
+  }
+
   useEffect(() => {
     void fetchQueues();
     void fetchActivity();
-    const interval = setInterval(() => { void fetchQueues(); void fetchActivity(); }, 4_000);
+    void fetchIntakeStats();
+    const interval = setInterval(() => {
+      void fetchQueues();
+      void fetchActivity();
+      void fetchIntakeStats();
+    }, 4_000);
     return () => clearInterval(interval);
   }, []);
 
@@ -130,14 +243,29 @@ export default function QueuesPage() {
 
   async function injectScenario(scenario: string) {
     setSimLoading(scenario);
+    setSimFeedback(null);
     try {
-      await fetch('/api/simulate/inbound', {
+      const res = await fetch('/api/simulate/inbound', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ scenario }),
       });
+      if (res.ok) {
+        const body = (await res.json()) as { itemIds?: string[]; count?: number; itemId?: string };
+        if (body.count !== undefined) {
+          setSimFeedback(`+${body.count} items injected`);
+        } else if (body.itemIds?.length) {
+          setSimFeedback(`+${body.itemIds.length} items injected`);
+        } else if (body.itemId) {
+          setSimFeedback('+1 item injected');
+        }
+      }
       void fetchQueues();
-    } finally { setSimLoading(null); }
+      void fetchIntakeStats();
+    } finally {
+      setSimLoading(null);
+      setTimeout(() => setSimFeedback(null), 4_000);
+    }
   }
 
   async function doTick(silent = false) {
@@ -159,6 +287,7 @@ export default function QueuesPage() {
         }
         void fetchQueues();
         void fetchActivity();
+        void fetchIntakeStats();
       }
     } finally { if (!silent) setTickLoading(false); }
   }
@@ -184,9 +313,17 @@ export default function QueuesPage() {
           <span style={{ fontSize: '0.75rem', color: 'var(--color-warning)', fontWeight: 600 }}>stale</span>
         )}
       </div>
-      <p style={{ color: 'var(--color-ink-muted)', marginTop: 0, marginBottom: '28px', fontSize: '0.88rem' }}>
+      <p style={{ color: 'var(--color-ink-muted)', marginTop: 0, marginBottom: '20px', fontSize: '0.88rem' }}>
         Live queue board — updates every 4 seconds.
       </p>
+
+      {/* Intake stats strip */}
+      {!statsError && intakeStats && (
+        <IntakeStatsStrip stats={intakeStats} />
+      )}
+      {statsError && (
+        <div style={{ marginBottom: '20px' }} />
+      )}
 
       {/* Queue cards */}
       <div
@@ -274,6 +411,42 @@ export default function QueuesPage() {
           <p style={{ fontSize: '0.78rem', color: 'var(--color-ink-muted)', margin: '0 0 14px' }}>
             Inject a scenario or advance the world clock.
           </p>
+
+          {/* Batch morning button — prominent */}
+          <button
+            onClick={() => void injectScenario('batch_morning')}
+            disabled={simLoading === 'batch_morning'}
+            className="btn btn-primary"
+            style={{
+              width: '100%',
+              justifyContent: 'center',
+              marginBottom: '10px',
+              fontSize: '0.84rem',
+              fontWeight: 700,
+              padding: '10px 16px',
+              opacity: simLoading !== null && simLoading !== 'batch_morning' ? 0.6 : 1,
+            }}
+          >
+            {simLoading === 'batch_morning' ? '↻ Injecting…' : '☀️ Morning batch (8)'}
+          </button>
+
+          {/* Feedback toast */}
+          {simFeedback && (
+            <div
+              style={{
+                padding: '7px 12px',
+                background: 'var(--color-success-bg)',
+                border: '1px solid #bbf7d0',
+                borderRadius: 'var(--radius-sm)',
+                fontSize: '0.80rem',
+                color: 'var(--color-success)',
+                fontWeight: 600,
+                marginBottom: '10px',
+              }}
+            >
+              {simFeedback}
+            </div>
+          )}
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginBottom: '14px' }}>
             {SCENARIOS.map((s) => (

@@ -1,7 +1,9 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useRouter } from 'next/navigation';
 import type { PortalAttempt } from '@/lib/portal';
+import { usePersona } from '@/app/components/PersonaProvider';
 
 // ---------------------------------------------------------------------------
 // Channel badge helpers
@@ -433,6 +435,8 @@ interface Props {
 
 export default function PortalInboxPage({ params }: Props) {
   const { orgId } = params;
+  const { persona, setPersona, hydrated } = usePersona();
+  const router = useRouter();
 
   const [attempts, setAttempts] = useState<PortalAttempt[]>([]);
   const [orgName, setOrgName] = useState<string>('');
@@ -463,12 +467,6 @@ export default function PortalInboxPage({ params }: Props) {
       const org = body.data?.find((o) => o.id === orgId);
       if (org) {
         setOrgName(org.name);
-        // Remember for "Continue as" on landing page
-        try {
-          localStorage.setItem('portal_last_org', JSON.stringify({ id: orgId, name: org.name }));
-        } catch {
-          // ignore
-        }
       }
     } catch {
       // non-critical
@@ -478,13 +476,25 @@ export default function PortalInboxPage({ params }: Props) {
   useEffect(() => {
     void fetchInbox();
     void fetchOrgName();
-
-    // Poll every 4s
-    const interval = setInterval(() => {
-      void fetchInbox();
-    }, 4_000);
+    const interval = setInterval(() => void fetchInbox(), 4_000);
     return () => clearInterval(interval);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [orgId]);
+
+  // Determine persona alignment once we know the org name
+  // console-mode visiting /portal/<orgId>: show offer-to-switch banner
+  // provider-mode but different orgId: show offer-to-switch banner
+  const showOfferBanner = hydrated && (
+    persona.mode === 'console' ||
+    (persona.mode === 'provider' && persona.orgId !== orgId)
+  );
+
+  const resolvedOrgName = orgName || orgId;
+
+  function handleSwitchPersona() {
+    setPersona({ mode: 'provider', orgId, orgName: resolvedOrgName });
+    // Stay on this page — the nav will switch to provider mode
+  }
 
   return (
     <div style={{ maxWidth: '780px', margin: '0 auto', padding: '40px 24px' }}>
@@ -492,11 +502,27 @@ export default function PortalInboxPage({ params }: Props) {
       <div style={{ marginBottom: '24px' }}>
         <a
           href="/portal"
-          style={{ fontSize: '0.82rem', color: '#4f46e5', textDecoration: 'none', fontWeight: 600 }}
+          style={{ fontSize: '0.82rem', color: 'var(--color-portal)', textDecoration: 'none', fontWeight: 600 }}
         >
           ← Provider Portal
         </a>
       </div>
+
+      {/* Offer-to-switch banner (console mode viewing a portal, or wrong provider org) */}
+      {showOfferBanner && (
+        <div className="portal-offer-banner">
+          <span style={{ flex: 1 }}>
+            {persona.mode === 'console'
+              ? `You are in Network Console mode. To act as `
+              : `You are acting as ${persona.orgName}. To switch to `}
+            <strong>{resolvedOrgName}</strong>
+            {persona.mode === 'console' ? ',' : ','} use the button to set your persona.
+          </span>
+          <button className="portal-offer-banner-btn" onClick={handleSwitchPersona}>
+            View as {resolvedOrgName}
+          </button>
+        </div>
+      )}
 
       {/* Header */}
       <div style={{ marginBottom: '28px' }}>
@@ -504,29 +530,31 @@ export default function PortalInboxPage({ params }: Props) {
           style={{
             display: 'inline-block',
             padding: '4px 10px',
-            background: '#ccfbf1',
+            background: 'var(--color-portal-bg)',
             borderRadius: '20px',
             fontSize: '0.72rem',
             fontWeight: 700,
-            color: '#0d9488',
+            color: 'var(--color-portal)',
             letterSpacing: '0.06em',
             textTransform: 'uppercase',
             marginBottom: '10px',
           }}
         >
-          On Network
+          {hydrated && persona.mode === 'provider' && persona.orgId === orgId
+            ? `Viewing as ${resolvedOrgName}`
+            : 'On Network'}
         </div>
-        <h1 style={{ fontSize: '1.6rem', fontWeight: 800, color: '#16181d', margin: '0 0 6px' }}>
-          {orgName || orgId}
+        <h1 style={{ fontSize: '1.6rem', fontWeight: 800, color: 'var(--color-ink)', margin: '0 0 6px' }}>
+          {resolvedOrgName}
         </h1>
-        <p style={{ color: '#6b7280', margin: 0, fontSize: '0.88rem' }}>
+        <p style={{ color: 'var(--color-ink-muted)', margin: 0, fontSize: '0.88rem' }}>
           Inbox — records requests sent to your organization. Updates every 4 seconds.
         </p>
       </div>
 
       {/* Loading */}
       {loading && (
-        <div style={{ color: '#9ca3af', padding: '32px 0' }}>Loading inbox…</div>
+        <div style={{ color: 'var(--color-ink-faint)', padding: '32px 0' }}>Loading inbox…</div>
       )}
 
       {/* Error */}
@@ -534,10 +562,10 @@ export default function PortalInboxPage({ params }: Props) {
         <div
           style={{
             padding: '16px',
-            background: '#fef2f2',
+            background: 'var(--color-error-bg)',
             border: '1px solid #fecaca',
             borderRadius: '8px',
-            color: '#dc2626',
+            color: 'var(--color-error)',
             fontSize: '0.85rem',
             marginBottom: '16px',
           }}
@@ -552,14 +580,14 @@ export default function PortalInboxPage({ params }: Props) {
           style={{
             textAlign: 'center',
             padding: '60px 24px',
-            color: '#9ca3af',
-            background: '#fff',
-            border: '1px solid #e6e8ee',
+            color: 'var(--color-ink-faint)',
+            background: 'var(--color-surface)',
+            border: '1px solid var(--color-border)',
             borderRadius: '10px',
           }}
         >
           <div style={{ fontSize: '2rem', marginBottom: '12px' }}>📥</div>
-          <div style={{ fontWeight: 700, color: '#6b7280', marginBottom: '4px' }}>No requests yet</div>
+          <div style={{ fontWeight: 700, color: 'var(--color-ink-muted)', marginBottom: '4px' }}>No requests yet</div>
           <div style={{ fontSize: '0.85rem' }}>
             Records requests addressed to your organization will appear here.
           </div>

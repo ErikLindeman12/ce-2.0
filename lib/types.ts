@@ -300,6 +300,7 @@ export interface WorkItemSummary {
   confidence: Record<string, number>;
   extractedData: Record<string, unknown>;
   agentState: Record<string, unknown>;
+  matchedPatientId: string | null;
   patient: PatientSummary | null;
   org: { id: string; name: string } | null;
 }
@@ -385,6 +386,7 @@ export function toWorkItemSummary(item: WorkItem): WorkItemSummary {
     confidence: item.confidence,
     extractedData: item.extracted_data,
     agentState: item.agent_state,
+    matchedPatientId: item.matched_patient_id ?? null,
     patient: item.patient
       ? toPatientSummary(item.patient as Patient)
       : null,

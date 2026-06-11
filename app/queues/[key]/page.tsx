@@ -30,19 +30,23 @@ type WorkItemWithAgentState = WorkItem;
 // ---------------------------------------------------------------------------
 
 const CHANNEL_ICONS: Record<string, string> = {
-  fax:    '📠',
-  email:  '✉️',
-  sms:    '💬',
-  voice:  '📞',
-  portal: '🌐',
+  fax:            '📠',
+  email:          '✉️',
+  sms:            '💬',
+  voice:          '📞',
+  phone:          '📞',
+  portal:         '🌐',
+  direct_message: '✉️',
 };
 
 const CHANNEL_LABELS: Record<string, string> = {
-  fax:    'Fax',
-  email:  'Email',
-  sms:    'SMS',
-  voice:  'Voice',
-  portal: 'Portal',
+  fax:            'Fax',
+  email:          'Email',
+  sms:            'SMS',
+  voice:          'Voice',
+  phone:          'Phone',
+  portal:         'Portal',
+  direct_message: 'DM',
 };
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ import { getSupabase } from './supabase';
 import { runAgents } from './agentRunner';
 import { createWorkItem } from './workItems';
 import { runTool } from './tools';
-import { SAMPLE_DOCS, type ScenarioKey } from './sampleDocs';
+import { SAMPLE_DOCS, type ScenarioKey, type BatchKey } from './sampleDocs';
 import {
   renderOutboundDocument,
   renderRecordsTransmittal,
@@ -20,10 +20,44 @@ import {
 import type { TickReport, WorkItem } from './types';
 
 // ---------------------------------------------------------------------------
-// injectInbound
+// Batch scenario definitions
 // ---------------------------------------------------------------------------
 
-export async function injectInbound(scenario: ScenarioKey): Promise<WorkItem> {
+const BATCH_MORNING: ScenarioKey[] = [
+  'fax_referral_clean',
+  'fax_roi_clean',
+  'fax_ambiguous_patient',
+  'fax_messy',
+  'dm_records_request',
+  'call_referral',
+  'fax_referral_partial',
+  'fax_roi_missing_auth',
+];
+
+// ---------------------------------------------------------------------------
+// injectInbound — single scenario or batch
+// ---------------------------------------------------------------------------
+
+export async function injectInbound(scenario: ScenarioKey): Promise<WorkItem & { itemId: string }>;
+export async function injectInbound(scenario: BatchKey): Promise<{ itemIds: string[] }>;
+export async function injectInbound(
+  scenario: ScenarioKey | BatchKey,
+): Promise<(WorkItem & { itemId: string }) | { itemIds: string[] }> {
+  if (scenario === 'batch_morning') {
+    const itemIds: string[] = [];
+    for (const s of BATCH_MORNING) {
+      const item = await injectSingle(s);
+      itemIds.push(item.id);
+    }
+    console.log('[simulate.inbound]', JSON.stringify({ scenario: 'batch_morning', count: itemIds.length, itemIds }));
+    return { itemIds };
+  }
+
+  const item = await injectSingle(scenario as ScenarioKey);
+  return { ...item, itemId: item.id };
+}
+
+async function injectSingle(scenario: ScenarioKey): Promise<WorkItem> {
   const doc = SAMPLE_DOCS[scenario];
   if (!doc) throw new Error(`Unknown scenario: ${scenario}`);
 

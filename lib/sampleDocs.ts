@@ -1,5 +1,5 @@
 /**
- * lib/sampleDocs.ts — canned fax/DM texts for the six simulation scenarios.
+ * lib/sampleDocs.ts — canned fax/DM texts for the simulation scenarios.
  *
  * Heuristic confidence requirements:
  *   fax_referral_clean    → classify ≥0.9, extract ≥0.85, match ≥0.9 (exact name+DOB)
@@ -8,6 +8,9 @@
  *   fax_messy             → classify ~0.3, extract ~0.2  (no labels, garbled)
  *   dm_records_request    → classify ≥0.9, extract ≥0.9, match ≥0.97 (exact name+DOB via JSON-ish)
  *   fax_roi_missing_auth  → classify ≥0.9, extract ~0.5 (auth line missing → low completeness)
+ *   call_referral         → classify ≥0.9, extract ≥0.9 (CALL SUMMARY block), match ≥0.97
+ *   call_records_request  → classify ≥0.9, extract ≥0.9 (CALL SUMMARY block), match ≥0.97
+ *   fax_referral_partial  → classify ≥0.9, extract ~0.85 (labeled), match ~0.6 (fuzzy single-candidate)
  */
 
 export type ScenarioKey =
@@ -16,11 +19,16 @@ export type ScenarioKey =
   | 'fax_ambiguous_patient'
   | 'fax_messy'
   | 'dm_records_request'
-  | 'fax_roi_missing_auth';
+  | 'fax_roi_missing_auth'
+  | 'call_referral'
+  | 'call_records_request'
+  | 'fax_referral_partial';
+
+export type BatchKey = 'batch_morning';
 
 export interface SampleDoc {
   scenario: ScenarioKey;
-  source_channel: 'fax' | 'direct_message';
+  source_channel: 'fax' | 'direct_message' | 'phone';
   /** org_id of the sending org (used to set org_id on the work item) */
   from_org_id: string;
   source_text: string;
@@ -211,6 +219,103 @@ Reason: Specialist co-management.
 Please fax records to +1-510-555-0142.
 
 NOTE: Authorization form to follow under separate cover.
+`.trim(),
+  },
+
+  // -------------------------------------------------------------------------
+  // 7. Phone call artifact — cardiology referral for Thomas Reyes (MRN-00108)
+  //    source_channel: 'phone'; transcript + CALL SUMMARY block
+  //    classify ≥0.9 (referral keyword), extract ≥0.9 (labeled block), match ≥0.97
+  // -------------------------------------------------------------------------
+  call_referral: {
+    scenario: 'call_referral',
+    source_channel: 'phone',
+    from_org_id: 'org_aurora',
+    source_text: `
+Thanks for calling Froedtert Hospital referral intake, this is Jamie speaking.
+Hi Jamie, this is Dana Reyes from Lakeview Family Medicine, how are you?
+Doing great, thanks for calling. What can I help you with today?
+We'd like to refer one of our patients to your cardiology department for evaluation of exertional chest pain.
+Of course, I can take that information. Go ahead.
+Patient's name is Thomas Reyes, date of birth December 3rd, 1988.
+And the reason for referral?
+He's been having exertional chest pain on moderate activity for the past six weeks. We did an EKG — it came back with some nonspecific ST changes. We'd like a full cardiology workup.
+Got it. And your callback number?
+Sure, it's plus one six oh eight five five five four four four four.
+Great. I'll get that entered. You should receive a confirmation shortly.
+
+---------------- CALL SUMMARY (auto-transcribed) ----------------
+Caller:    Dana Reyes — Lakeview Family Medicine
+Patient:   Thomas Reyes
+DOB:       1988-12-03
+Reason:    Cardiology referral — exertional chest pain, nonspecific ST changes
+Callback:  +1-608-555-4444
+`.trim(),
+  },
+
+  // -------------------------------------------------------------------------
+  // 8. Phone call artifact — records request for David Kim (MRN-00106)
+  //    source_channel: 'phone'; transcript + CALL SUMMARY block
+  //    classify ≥0.9 (records request keywords), extract ≥0.9, match ≥0.97
+  //    flows to roi_incoming and is fulfilled like any ROI
+  // -------------------------------------------------------------------------
+  call_records_request: {
+    scenario: 'call_records_request',
+    source_channel: 'phone',
+    from_org_id: 'org_jhh',
+    source_text: `
+Good morning, Froedtert records department, this is Alex.
+Hi Alex, calling from Johns Hopkins Hospital records team. I need to request some records for a patient of yours.
+Sure, happy to help. What's the patient name?
+Patient is David Kim, date of birth February 28th, 1945.
+And what records are you looking for?
+We need all cardiology notes and echocardiogram results from 2023 to present. The patient has a follow-up with us next week.
+Do you have authorization on file?
+Yes, the patient signed a HIPAA authorization form. I'll fax a copy to your records fax line after this call. Authorization number AUTH-20260611-0106.
+Perfect, we'll watch for that and get those pulled together for you.
+Great, thank you so much.
+
+---------------- CALL SUMMARY (auto-transcribed) ----------------
+Caller:    Alex Chen — Johns Hopkins Hospital Records
+Patient:   David Kim
+DOB:       1945-02-28
+Records Requested: All cardiology notes and echocardiogram results from 2023-01-01 to present
+Authorization:     AUTH-20260611-0106 — patient signed HIPAA auth, fax to follow
+Callback:  +1-410-555-7777
+`.trim(),
+  },
+
+  // -------------------------------------------------------------------------
+  // 9. Fax with slightly misspelled patient name vs MPI ("Jame" not "James")
+  //    Patient: James Whitfield (MRN-00101, DOB: 1955-08-14)
+  //    classify ≥0.9, extract ~0.85 (labels present), match ~0.6 (fuzzy single-candidate)
+  //    → escalates with "Closest MPI match is James Whitfield (DOB …, MRN …) — is this the right patient?"
+  // -------------------------------------------------------------------------
+  fax_referral_partial: {
+    scenario: 'fax_referral_partial',
+    source_channel: 'fax',
+    from_org_id: 'org_mayo',
+    source_text: `
+REFERRAL REQUEST — FAX TRANSMISSION
+=====================================
+From:     Dr. Michael Brooks, Mayo Clinic
+Fax:      +1-507-555-0100
+Date:     2026-06-11
+
+To:       Froedtert Hospital — Cardiology
+Fax:      +1-414-555-0142
+
+Patient:  Jame Whitfield
+DOB:      1955-08-14
+Phone:    +1-608-555-0101
+
+Reason:   Cardiology referral — exertional chest pain, worsening over 2 months.
+          Recent stress test abnormal. Requesting urgent evaluation.
+
+Priority: Routine
+Provider: Dr. Michael Brooks NPI 8901234567
+
+Please confirm receipt.
 `.trim(),
   },
 };

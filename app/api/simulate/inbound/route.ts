@@ -1,6 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { injectInbound } from '@/lib/simulate';
-import type { ScenarioKey } from '@/lib/sampleDocs';
+import type { ScenarioKey, BatchKey } from '@/lib/sampleDocs';
 
 const VALID_SCENARIOS: ScenarioKey[] = [
   'fax_referral_clean',
@@ -9,7 +9,12 @@ const VALID_SCENARIOS: ScenarioKey[] = [
   'fax_messy',
   'dm_records_request',
   'fax_roi_missing_auth',
+  'call_referral',
+  'call_records_request',
+  'fax_referral_partial',
 ];
+
+const VALID_BATCHES: BatchKey[] = ['batch_morning'];
 
 export async function POST(req: NextRequest) {
   let body: { scenario: string };
@@ -19,17 +24,37 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  const scenario = body?.scenario as ScenarioKey;
-  if (!VALID_SCENARIOS.includes(scenario)) {
+  const scenario = body?.scenario as string;
+
+  if (VALID_BATCHES.includes(scenario as BatchKey)) {
+    try {
+      const result = await injectInbound(scenario as BatchKey);
+      return NextResponse.json(
+        { status: 'injected', itemIds: result.itemIds, count: result.itemIds.length, scenario },
+        { status: 201 },
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[simulate.inbound_failed]', msg);
+      return NextResponse.json({ error: 'Failed to inject batch scenario' }, { status: 500 });
+    }
+  }
+
+  if (!VALID_SCENARIOS.includes(scenario as ScenarioKey)) {
     return NextResponse.json(
-      { error: `Unknown scenario. Valid: ${VALID_SCENARIOS.join(', ')}` },
+      {
+        error: `Unknown scenario. Valid: ${[...VALID_SCENARIOS, ...VALID_BATCHES].join(', ')}`,
+      },
       { status: 400 },
     );
   }
 
   try {
-    const item = await injectInbound(scenario);
-    return NextResponse.json({ status: 'injected', itemId: item.id, scenario }, { status: 201 });
+    const result = await injectInbound(scenario as ScenarioKey);
+    return NextResponse.json(
+      { status: 'injected', itemId: result.itemId, scenario },
+      { status: 201 },
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[simulate.inbound_failed]', msg);

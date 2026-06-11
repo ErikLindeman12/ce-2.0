@@ -10,6 +10,7 @@
 
 import { getSupabase } from './supabase';
 import { renderOutboundDocument, type Channel, type DocumentKind } from './outbound';
+import { matchPatientHeuristic } from './llm';
 import type { ToolDef, ToolResult, OutboundChannel } from './types';
 
 // ---------------------------------------------------------------------------
@@ -230,7 +231,7 @@ export const TOOLS: Record<string, ToolDef> = {
       const sb = getSupabase();
       const { data: item } = await sb
         .from('work_items')
-        .select('extracted_data,confidence')
+        .select('extracted_data,confidence,agent_state')
         .eq('id', workItemId)
         .single();
 
@@ -238,12 +239,21 @@ export const TOOLS: Record<string, ToolDef> = {
         ?.extracted_data ?? {};
       const existingConf =
         (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
+      const existingState =
+        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
+
+      // Merge extraction_meta into agent_state when present
+      const extractionMeta = params['extraction_meta'] as Record<string, unknown> | undefined;
+      const updatedState = extractionMeta
+        ? { ...existingState, extraction_meta: extractionMeta }
+        : existingState;
 
       const { error } = await sb
         .from('work_items')
         .update({
           extracted_data: { ...existing, ...fields },
           confidence: { ...existingConf, extract: params['confidence'] ?? 0.8 },
+          agent_state: updatedState,
           updated_at: new Date().toISOString(),
         })
         .eq('id', workItemId);
@@ -549,8 +559,22 @@ export const TOOLS: Record<string, ToolDef> = {
         | string
         | undefined;
       const nextQueue = (params['queue_key'] ?? params['queueKey']) as string | undefined;
+      const correctedFields = params['fields'] as Record<string, string> | undefined;
 
       const sb = getSupabase();
+
+      // Fetch current item state for merging
+      const { data: currentItem } = await sb
+        .from('work_items')
+        .select('type,confidence,extracted_data')
+        .eq('id', workItemId)
+        .single();
+
+      const existingConf =
+        (currentItem as { confidence: Record<string, number> } | null)?.confidence ?? {};
+      const existingExtracted =
+        (currentItem as { extracted_data: Record<string, unknown> } | null)?.extracted_data ?? {};
+
       const updates: Record<string, unknown> = {
         assignee: 'unassigned',
         review_reason: null,
@@ -558,28 +582,38 @@ export const TOOLS: Record<string, ToolDef> = {
         updated_at: new Date().toISOString(),
       };
 
+      // Merge corrected fields and audit which keys changed
+      let changedKeys: string[] = [];
+      let patientFieldsChanged = false;
+      if (correctedFields && Object.keys(correctedFields).length > 0) {
+        const patientFieldSet = new Set(['patient_first_name', 'patient_last_name', 'patient_dob', 'patient_mrn', 'patient_name']);
+        changedKeys = Object.keys(correctedFields).filter(
+          (k) => existingExtracted[k] !== correctedFields[k],
+        );
+        patientFieldsChanged = changedKeys.some((k) => patientFieldSet.has(k));
+        updates['extracted_data'] = { ...existingExtracted, ...correctedFields };
+      }
+
       if (chosenPatientId) {
         updates['matched_patient_id'] = chosenPatientId;
-        const { data: item } = await sb
-          .from('work_items')
-          .select('confidence')
-          .eq('id', workItemId)
-          .single();
-        const existingConf =
-          (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
         updates['confidence'] = { ...existingConf, match: 0.99 };
+      } else if (patientFieldsChanged && correctedFields) {
+        // Re-run patient match with corrected fields
+        const mergedExtracted = { ...existingExtracted, ...correctedFields } as Record<string, string>;
+        const matchResult = await matchPatientHeuristic(mergedExtracted);
+        if (matchResult.patientId) {
+          updates['matched_patient_id'] = matchResult.patientId;
+          updates['confidence'] = { ...existingConf, match: matchResult.confidence };
+        } else {
+          updates['confidence'] = { ...existingConf, match: matchResult.confidence };
+        }
       }
 
       if (nextQueue) {
         updates['queue_key'] = nextQueue;
       } else {
         // Default routing after review
-        const { data: item } = await sb
-          .from('work_items')
-          .select('type')
-          .eq('id', workItemId)
-          .single();
-        const itemType = (item as { type: string } | null)?.type;
+        const itemType = (currentItem as { type: string } | null)?.type;
         if (itemType === 'referral') updates['queue_key'] = 'referrals';
         else if (itemType === 'records_request_in') updates['queue_key'] = 'roi_incoming';
         else updates['queue_key'] = 'intake';
@@ -587,7 +621,14 @@ export const TOOLS: Record<string, ToolDef> = {
 
       const { error } = await sb.from('work_items').update(updates).eq('id', workItemId);
       if (error) return { success: false, error: error.message };
-      return { success: true, data: { resolved: true, patient_id: chosenPatientId ?? null } };
+      return {
+        success: true,
+        data: {
+          resolved: true,
+          patient_id: chosenPatientId ?? null,
+          changed_fields: changedKeys,
+        },
+      };
     },
   },
 };
