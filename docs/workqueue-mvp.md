@@ -264,6 +264,58 @@ Log `[agent.run]` per action. Concurrency-safe enough via the assignee claim.
    faxes now escalate to Human Review (shadow-mode story); create a new agent
    via the form and see it act on the next tick.
 
+## API contract (pinned — UI and routes are built in parallel against these exact shapes)
+
+All responses are `{data: ...}` on success, `{error: {message}}` with non-200 on
+failure. API uses camelCase; DB uses snake_case (map in `lib/`).
+
+```
+GET  /api/queues
+  → {data: [{key, name, description, sortOrder, count}]}
+
+GET  /api/work-items?queue=<key>
+  → {data: WorkItemSummary[]}
+  WorkItemSummary = {id, type, queueKey, status, sourceChannel, createdAt,
+    updatedAt, assignee, reviewReason, confidence, extractedData,
+    patient: {id, firstName, lastName, dob, mrn} | null,
+    org: {id, name} | null}
+
+GET  /api/work-items/<id>
+  → {data: {item: WorkItemSummary & {sourceText, agentState},
+            audit: [{id, actor, action, detail, createdAt}],
+            attempts: [{id, channel, attemptNo, status, toContact, payload,
+                        response, respondAfter, createdAt}],
+            patientCandidates: [{id, firstName, lastName, dob, mrn}]}}
+  (patientCandidates non-empty when the item is in human_review over an
+   ambiguous patient match)
+
+POST /api/work-items/<id>/actions   body {tool, params}
+  → {data: {ok: true, result}}
+
+GET  /api/agents → {data: Agent[]}
+POST /api/agents   body {name, queueKey, instructions, tools,
+                         confidenceThreshold, model, enabled} → {data: Agent}
+PATCH /api/agents/<id>  (partial body) → {data: Agent}
+  Agent = {id, name, queueKey, enabled, instructions, tools,
+           confidenceThreshold, model, createdAt}
+
+GET  /api/patients → {data: [{id, firstName, lastName, dob, mrn}]}
+
+POST /api/roi   body {patientId, orgId, recordsRequested, channel?}
+  → {data: {workItemId}}
+
+POST /api/simulate/inbound   body {scenario}
+  → {data: {workItemId, queueKey}}
+
+POST /api/simulate/tick
+  → {data: {events: [{itemId, actor, action, summary}]}}
+
+GET  /api/activity?limit=30
+  → {data: [{id, workItemId, actor, action, detail, createdAt}]}
+```
+
+Existing `GET /api/organizations?q=` is reused for the org picker.
+
 ## Non-goals (MVP)
 
 Auth (portal stays open), real channel I/O, real OCR, Supabase Realtime,
