@@ -8,8 +8,16 @@ import type { WorkItem, AuditLogEntry, OutboundAttempt, Patient } from '@/lib/ty
 // Extended types
 // ---------------------------------------------------------------------------
 
+interface ChaseStep {
+  channel: string;
+  attempt: number;
+}
+
 interface ChasePlan {
-  channels: string[];
+  // New shape: steps with attempt numbers
+  steps?: ChaseStep[];
+  // Legacy shape: flat channel array
+  channels?: string[];
   waitSeconds: number;
 }
 
@@ -81,21 +89,23 @@ interface AttemptWithDoc extends OutboundAttempt {
 // ---------------------------------------------------------------------------
 
 const CHANNEL_ICONS: Record<string, string> = {
-  fax:    '📠',
-  email:  '✉️',
-  sms:    '💬',
-  voice:  '📞',
-  phone:  '📞',
-  portal: '🌐',
+  fax:            '📠',
+  email:          '✉️',
+  sms:            '💬',
+  voice:          '📞',
+  phone:          '📞',
+  portal:         '🌐',
+  care_everywhere:'⚡',
 };
 
 const CHANNEL_LABELS: Record<string, string> = {
-  fax:    'Fax',
-  email:  'Email',
-  sms:    'SMS',
-  voice:  'Voice',
-  phone:  'Phone',
-  portal: 'In-app',
+  fax:            'Fax',
+  email:          'Secure Email',
+  sms:            'SMS',
+  voice:          'Voice',
+  phone:          'Phone',
+  portal:         'In-app',
+  care_everywhere:'Care Everywhere',
 };
 
 function confidenceColor(score: number) {
@@ -275,24 +285,53 @@ function ChaseStepperHeader({
   itemStatus: string;
 }) {
   const plan = agentState.chase_plan;
-  if (!plan || !plan.channels || plan.channels.length === 0) return null;
+  if (!plan) return null;
+
+  // Normalize to a steps array — handle both new {steps} and legacy {channels} shapes
+  type NormStep = { channel: string; attempt: number };
+  let steps: NormStep[];
+  if (plan.steps && plan.steps.length > 0) {
+    steps = plan.steps;
+  } else if (plan.channels && plan.channels.length > 0) {
+    const counts: Record<string, number> = {};
+    steps = plan.channels.map((ch) => {
+      counts[ch] = (counts[ch] ?? 0) + 1;
+      return { channel: ch, attempt: counts[ch] };
+    });
+  } else {
+    return null;
+  }
+
+  if (steps.length === 0) return null;
 
   const isDone = itemStatus === 'done';
   const isHumanReview = itemStatus === 'human_review' || false;
   const attemptNo = agentState.attempt_no ?? attempts.length;
 
+  const isCE = steps.length === 1 && steps[0].channel === 'care_everywhere';
+
+  // Count repeats to know whether to show "(1st)/(2nd)" labels
+  const channelCounts: Record<string, number> = {};
+  for (const s of steps) channelCounts[s.channel] = (channelCounts[s.channel] ?? 0) + 1;
+  const hasRepeats = Object.values(channelCounts).some((c) => c > 1);
+
+  const ordinals = ['1st', '2nd', '3rd', '4th'];
+
   return (
     <div className="card" style={{ marginBottom: '24px', padding: '16px 20px' }}>
-      <div className="section-label">Chase Plan — {plan.channels.length} channel{plan.channels.length !== 1 ? 's' : ''}, {plan.waitSeconds}s wait</div>
+      <div className="section-label">
+        {isCE
+          ? 'Care Everywhere — structured exchange'
+          : `Chase Plan — ${steps.length} step${steps.length !== 1 ? 's' : ''}, ${plan.waitSeconds}s wait`}
+      </div>
       <div className="stepper">
-        {plan.channels.map((ch, i) => {
-          const chIdx = i + 1;
-          // Determine step state from attempts
-          const attForChannel = attempts.filter((a) => a.channel === ch);
-          const lastAtt = attForChannel[attForChannel.length - 1];
+        {steps.map((s, i) => {
+          // Match attempt cards by channel + attempt number where possible
+          const attForChannel = attempts.filter((a) => a.channel === s.channel);
+          // attempt is 1-based; pick the attempt_no-th one
+          const lastAtt = attForChannel[s.attempt - 1] ?? attForChannel[attForChannel.length - 1];
 
           let stepClass = '';
-          let icon = CHANNEL_ICONS[ch] ?? '?';
           let stateLabel = '';
 
           if (lastAtt) {
@@ -306,25 +345,31 @@ function ChaseStepperHeader({
               stepClass = 'active';
               stateLabel = '●';
             }
-          } else if (isDone && chIdx <= attemptNo) {
+          } else if (isDone && (i + 1) <= attemptNo) {
             stepClass = 'done';
             stateLabel = '✓';
-          } else if ((isHumanReview) && chIdx <= attemptNo) {
+          } else if (isHumanReview && (i + 1) <= attemptNo) {
             stepClass = 'failed';
             stateLabel = '✗';
           }
 
+          const icon = CHANNEL_ICONS[s.channel] ?? '?';
+          const baseLabel = CHANNEL_LABELS[s.channel] ?? s.channel;
+          const displayLabel = hasRepeats && s.channel !== 'care_everywhere'
+            ? `${baseLabel} #${ordinals[s.attempt - 1] ?? s.attempt}`
+            : baseLabel;
+
           return (
-            <span key={ch} style={{ display: 'inline-flex', alignItems: 'center' }}>
+            <span key={i} style={{ display: 'inline-flex', alignItems: 'center' }}>
               <span
                 className={`stepper-step ${stepClass}`}
-                title={`${CHANNEL_LABELS[ch] ?? ch}${stateLabel ? ' — ' + stateLabel : ''}`}
+                title={`${displayLabel}${stateLabel ? ' — ' + stateLabel : ''}`}
               >
                 <span>{icon}</span>
-                <span>{CHANNEL_LABELS[ch] ?? ch}</span>
+                <span>{displayLabel}</span>
                 {stateLabel && <span>{stateLabel}</span>}
               </span>
-              {i < plan.channels.length - 1 && (
+              {i < steps.length - 1 && (
                 <span className="stepper-arrow">→ {plan.waitSeconds}s →</span>
               )}
             </span>
@@ -381,6 +426,7 @@ function AttemptCard({ att, index }: { att: AttemptWithDoc; index: number }) {
   const response = att.response;
 
   const isPortalChannel = att.channel === 'portal';
+  const isCEChannel = att.channel === 'care_everywhere';
   const isVoiceNoAnswer = response?.outcome === 'no_answer';
 
   return (
@@ -400,6 +446,23 @@ function AttemptCard({ att, index }: { att: AttemptWithDoc; index: number }) {
           {CHANNEL_LABELS[att.channel] ?? att.channel}
           {' '}— Attempt #{att.attempt_no ?? (index + 1)}
         </span>
+        {isCEChannel && (
+          <span
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '3px',
+              padding: '1px 8px',
+              borderRadius: '99px',
+              fontSize: '0.68rem',
+              fontWeight: 700,
+              background: '#4f46e5',
+              color: '#fff',
+            }}
+          >
+            Structured Exchange
+          </span>
+        )}
         <span
           className={`badge ${sb.badgeClass}`}
         >
@@ -436,7 +499,9 @@ function AttemptCard({ att, index }: { att: AttemptWithDoc; index: number }) {
           }}
         >
           <div className="section-label" style={{ marginBottom: '6px' }}>
-            Response {isPortalChannel ? '(via portal)' : ''}
+            Response
+            {isPortalChannel && ' (via portal)'}
+            {isCEChannel && ' (C-CDA structured return)'}
           </div>
 
           {/* Voice no-answer outcome */}

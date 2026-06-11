@@ -123,6 +123,11 @@ function IntakeStatsStrip({ stats }: { stats: IntakeStats }) {
               📞 <strong>{stats.byChannel.phone}</strong>
             </span>
           )}
+          {((stats.byChannel as Record<string, number | undefined>).care_everywhere ?? 0) > 0 && (
+            <span style={{ fontSize: '0.82rem', display: 'inline-flex', alignItems: 'center', gap: '3px' }}>
+              ⚡ <strong>{(stats.byChannel as Record<string, number | undefined>).care_everywhere}</strong>
+            </span>
+          )}
           {Object.values(stats.byChannel).every((v) => !v || v === 0) && (
             <span style={{ color: 'var(--color-ink-faint)', fontSize: '0.80rem' }}>—</span>
           )}

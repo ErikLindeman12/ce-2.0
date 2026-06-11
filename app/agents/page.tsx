@@ -18,6 +18,15 @@ interface AgentStats {
   autoRate: number;
 }
 
+interface ChasePolicyConfig {
+  steps: string[];  // e.g. ['fax', 'fax', 'voice']
+  waitSeconds: number;
+}
+
+interface AgentConfig {
+  chase_policy?: ChasePolicyConfig;
+}
+
 interface Agent {
   id: string;
   name: string;
@@ -30,6 +39,7 @@ interface Agent {
   confidence_threshold?: number;
   model: string;
   mode?: AgentMode;
+  config?: AgentConfig;
   createdAt?: string;
   created_at?: string;
 }
@@ -56,9 +66,226 @@ function normalizeAgent(a: Record<string, unknown>): Agent {
     confidence_threshold: (a.confidence_threshold ?? a.confidenceThreshold) as number,
     model: (a.model as string) ?? 'heuristic',
     mode: ((a.mode as AgentMode | undefined) ?? 'autonomous'),
+    config: (a.config as AgentConfig | undefined) ?? {},
     createdAt: (a.createdAt ?? a.created_at) as string | undefined,
     created_at: (a.created_at ?? a.createdAt) as string | undefined,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Escalation ladder editor (roi_outgoing agents only)
+// ---------------------------------------------------------------------------
+
+const LADDER_CHANNELS: Array<{ value: string; label: string; icon: string }> = [
+  { value: 'fax',   label: 'Fax',          icon: '📠' },
+  { value: 'email', label: 'Secure Email',  icon: '✉️' },
+  { value: 'sms',   label: 'SMS',           icon: '💬' },
+  { value: 'voice', label: 'Voice',         icon: '📞' },
+];
+
+function ladderReadout(steps: string[], waitSeconds: number): string {
+  const icons: Record<string, string> = { fax: '📠', email: '✉️', sms: '💬', voice: '📞' };
+  return steps.map((s) => icons[s] ?? s).join(' → ') + ` · ${waitSeconds}s`;
+}
+
+function EscalationLadderEditor({
+  agentId,
+  initialSteps,
+  initialWaitSeconds,
+  onSaved,
+}: {
+  agentId: string;
+  initialSteps: string[];
+  initialWaitSeconds: number;
+  onSaved: () => void;
+}) {
+  const [steps, setSteps] = useState<string[]>(initialSteps.length > 0 ? initialSteps : ['fax', 'fax', 'voice']);
+  const [waitSecs, setWaitSecs] = useState(initialWaitSeconds > 0 ? initialWaitSeconds : 30);
+  const [addChannel, setAddChannel] = useState('fax');
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
+  const [saveSuccess, setSaveSuccess] = useState(false);
+
+  function addStep() {
+    setSteps((prev) => [...prev, addChannel]);
+  }
+
+  function removeStep(idx: number) {
+    setSteps((prev) => prev.filter((_, i) => i !== idx));
+  }
+
+  function moveStep(idx: number, dir: -1 | 1) {
+    const newSteps = [...steps];
+    const target = idx + dir;
+    if (target < 0 || target >= newSteps.length) return;
+    [newSteps[idx], newSteps[target]] = [newSteps[target], newSteps[idx]];
+    setSteps(newSteps);
+  }
+
+  async function handleSave() {
+    setSaving(true);
+    setSaveError(null);
+    setSaveSuccess(false);
+    try {
+      const res = await fetch(`/api/agents/${agentId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          config: {
+            chase_policy: { steps, waitSeconds: waitSecs },
+          },
+        }),
+      });
+      if (!res.ok) {
+        const body = (await res.json()) as { error?: string };
+        setSaveError(body.error ?? 'Failed to save');
+      } else {
+        setSaveSuccess(true);
+        setTimeout(() => setSaveSuccess(false), 3000);
+        onSaved();
+      }
+    } catch (e) {
+      setSaveError(e instanceof Error ? e.message : 'Network error');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const icons: Record<string, string> = { fax: '📠', email: '✉️', sms: '💬', voice: '📞' };
+  const labels: Record<string, string> = { fax: 'Fax', email: 'Secure Email', sms: 'SMS', voice: 'Voice' };
+
+  return (
+    <div
+      style={{
+        marginTop: '14px',
+        padding: '14px 16px',
+        background: '#f8f9fc',
+        border: '1px solid var(--color-border)',
+        borderRadius: 'var(--radius)',
+      }}
+    >
+      <div style={{ fontSize: '11px', fontWeight: 700, letterSpacing: '0.07em', textTransform: 'uppercase', color: 'var(--color-ink-faint)', marginBottom: '10px' }}>
+        Escalation Ladder
+      </div>
+
+      {/* Step chips */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', marginBottom: '10px' }}>
+        {steps.length === 0 && (
+          <span style={{ fontSize: '0.80rem', color: 'var(--color-ink-faint)', fontStyle: 'italic' }}>No steps — add one below.</span>
+        )}
+        {steps.map((ch, i) => (
+          <span
+            key={i}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '4px',
+              padding: '4px 8px',
+              background: '#fff',
+              border: '1px solid var(--color-border-strong)',
+              borderRadius: '6px',
+              fontSize: '0.78rem',
+              fontWeight: 600,
+            }}
+          >
+            <span>{icons[ch] ?? ch}</span>
+            <span>{labels[ch] ?? ch}</span>
+            <button
+              onClick={() => moveStep(i, -1)}
+              disabled={i === 0}
+              title="Move left"
+              style={{ background: 'none', border: 'none', cursor: i === 0 ? 'default' : 'pointer', padding: '0 2px', color: 'var(--color-ink-faint)', opacity: i === 0 ? 0.3 : 1, fontSize: '0.72rem' }}
+            >
+              ◀
+            </button>
+            <button
+              onClick={() => moveStep(i, 1)}
+              disabled={i === steps.length - 1}
+              title="Move right"
+              style={{ background: 'none', border: 'none', cursor: i === steps.length - 1 ? 'default' : 'pointer', padding: '0 2px', color: 'var(--color-ink-faint)', opacity: i === steps.length - 1 ? 0.3 : 1, fontSize: '0.72rem' }}
+            >
+              ▶
+            </button>
+            <button
+              onClick={() => removeStep(i)}
+              title="Remove step"
+              style={{ background: 'none', border: 'none', cursor: 'pointer', padding: '0 2px', color: 'var(--color-error)', fontSize: '0.76rem', fontWeight: 700, lineHeight: 1 }}
+            >
+              ×
+            </button>
+          </span>
+        ))}
+      </div>
+
+      {/* Add step */}
+      <div style={{ display: 'flex', gap: '6px', alignItems: 'center', marginBottom: '10px' }}>
+        <select
+          value={addChannel}
+          onChange={(e) => setAddChannel(e.target.value)}
+          style={{ padding: '5px 8px', border: '1px solid var(--color-border-strong)', borderRadius: 'var(--radius-sm)', fontSize: '0.80rem', background: '#fff' }}
+        >
+          {LADDER_CHANNELS.map((c) => (
+            <option key={c.value} value={c.value}>{c.icon} {c.label}</option>
+          ))}
+        </select>
+        <button
+          onClick={addStep}
+          style={{
+            padding: '5px 10px',
+            background: 'var(--color-accent)',
+            color: '#fff',
+            border: 'none',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: '0.78rem',
+            fontWeight: 700,
+            cursor: 'pointer',
+          }}
+        >
+          + Add step
+        </button>
+      </div>
+
+      {/* Wait seconds */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '10px' }}>
+        <span style={{ fontSize: '0.78rem', color: 'var(--color-ink-muted)', fontWeight: 600 }}>Wait between steps:</span>
+        <input
+          type="number"
+          min={5}
+          max={300}
+          value={waitSecs}
+          onChange={(e) => setWaitSecs(Number(e.target.value))}
+          style={{ width: '64px', padding: '4px 8px', border: '1px solid var(--color-border-strong)', borderRadius: 'var(--radius-sm)', fontSize: '0.80rem' }}
+        />
+        <span style={{ fontSize: '0.78rem', color: 'var(--color-ink-faint)' }}>seconds</span>
+      </div>
+
+      {/* Save */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+        <button
+          onClick={() => void handleSave()}
+          disabled={saving || steps.length === 0}
+          style={{
+            padding: '6px 14px',
+            background: saving || steps.length === 0 ? 'var(--color-border)' : 'var(--color-success)',
+            color: saving || steps.length === 0 ? 'var(--color-ink-faint)' : '#fff',
+            border: 'none',
+            borderRadius: 'var(--radius-sm)',
+            fontSize: '0.78rem',
+            fontWeight: 700,
+            cursor: saving || steps.length === 0 ? 'default' : 'pointer',
+          }}
+        >
+          {saving ? 'Saving…' : 'Save ladder'}
+        </button>
+        {saveSuccess && (
+          <span style={{ fontSize: '0.78rem', color: 'var(--color-success)', fontWeight: 600 }}>Saved</span>
+        )}
+        {saveError && (
+          <span style={{ fontSize: '0.78rem', color: 'var(--color-error)' }}>{saveError}</span>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function agentQueueKey(a: Agent): string {
@@ -191,6 +418,9 @@ export default function AgentsPage() {
 
   // Per-agent stats (keyed by agent id; null = loading/error)
   const [agentStats, setAgentStats] = useState<Record<string, AgentStats | null>>({});
+
+  // Which agent's ladder editor is open (by agent id; null = none)
+  const [openLadderAgentId, setOpenLadderAgentId] = useState<string | null>(null);
 
   // ---------------------------------------------------------------------------
   // Load
@@ -441,6 +671,9 @@ export default function AgentsPage() {
           const currentMode: AgentMode = agent.mode ?? 'autonomous';
           const modePatching = patchingMode.has(agent.id);
           const stats = agentStats[agent.id] ?? null;
+          const isRoiOutgoing = queueKey === 'roi_outgoing';
+          const chasePolicy = agent.config?.chase_policy;
+          const showLadderEditor = openLadderAgentId === agent.id;
 
           return (
             <div key={agent.id} style={{
@@ -563,8 +796,52 @@ export default function AgentsPage() {
                     </div>
                   )}
 
+                  {/* Escalation ladder readout + editor — roi_outgoing agents only */}
+                  {isRoiOutgoing && (
+                    <div style={{ marginTop: '8px' }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--color-ink-muted)' }}>
+                          Ladder:
+                        </span>
+                        {chasePolicy?.steps?.length ? (
+                          <code style={{ fontSize: '0.75rem', background: '#f1f3f6', padding: '2px 7px', borderRadius: '4px', color: 'var(--color-ink)' }}>
+                            {ladderReadout(chasePolicy.steps, chasePolicy.waitSeconds)}
+                          </code>
+                        ) : (
+                          <span style={{ fontSize: '0.75rem', color: 'var(--color-ink-faint)', fontStyle: 'italic' }}>
+                            default (📠 → 📠 → 📞 · 30s)
+                          </span>
+                        )}
+                        <button
+                          onClick={() => setOpenLadderAgentId(showLadderEditor ? null : agent.id)}
+                          style={{
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            fontSize: '0.74rem',
+                            fontWeight: 600,
+                            color: 'var(--color-accent)',
+                            padding: '0',
+                            textDecoration: 'underline',
+                            textUnderlineOffset: '2px',
+                          }}
+                        >
+                          {showLadderEditor ? 'Close editor' : 'Edit ladder'}
+                        </button>
+                      </div>
+                      {showLadderEditor && (
+                        <EscalationLadderEditor
+                          agentId={agent.id}
+                          initialSteps={chasePolicy?.steps ?? []}
+                          initialWaitSeconds={chasePolicy?.waitSeconds ?? 30}
+                          onSaved={() => { void load(); setOpenLadderAgentId(null); }}
+                        />
+                      )}
+                    </div>
+                  )}
+
                   {agent.instructions && (
-                    <div style={{ fontSize: '0.78rem', color: '#6b7280', fontStyle: 'italic' }}>
+                    <div style={{ fontSize: '0.78rem', color: '#6b7280', fontStyle: 'italic', marginTop: '8px' }}>
                       {agent.instructions.length > 120
                         ? agent.instructions.slice(0, 120) + '…'
                         : agent.instructions}

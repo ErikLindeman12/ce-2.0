@@ -1,16 +1,32 @@
 /**
  * lib/outbound.ts — outbound document rendering + channel-plan module.
  *
- * buildChannelPlan(org, override?, waitSeconds?) → { channels, waitSeconds }
+ * buildChannelPlan(org, agentConfig?, override?, waitSeconds?) → ChasePlan
  * renderOutboundDocument(channel, kind, ctx) → { subject, body, document }
  *
  * All content is deterministic — no randomness beyond using the current Date
- * for the date line. The document string is the full artifact stored in
- * payload.document and rendered in the item detail UI.
+ * for the date line.
+ *
+ * W1b changes:
+ * - 'care_everywhere' added to Channel union.
+ * - buildChannelPlan now returns ChasePlan {steps: ChaseStep[], waitSeconds}
+ *   with resolution order: Epic org → care_everywhere; else org chase_policy;
+ *   else agent chase_policy; else default ['fax','fax','voice'].
+ * - Legacy {channels:[...]} shape is still readable by callers that check for it.
+ * - Portal channel removed from new plan resolution (kept for legacy reads).
  */
 
-export type Channel = 'fax' | 'email' | 'sms' | 'voice' | 'portal';
+import type { ChaseStep } from './types';
 
+export type Channel = 'fax' | 'email' | 'sms' | 'voice' | 'portal' | 'care_everywhere';
+
+/** New step-based plan shape (w1b) */
+export interface ChasePlan {
+  steps: ChaseStep[];
+  waitSeconds: number;
+}
+
+/** Legacy plan shape — kept for backward-compat reads in existing callers */
 export interface ChannelPlan {
   channels: Channel[];
   waitSeconds: number;
@@ -43,43 +59,86 @@ export interface RenderedDocument {
 }
 
 // ---------------------------------------------------------------------------
-// buildChannelPlan
+// isEpicOrg — detects Care Everywhere capability
 // ---------------------------------------------------------------------------
 
 /**
- * Build an ordered escalation list from the org's actual contact fields.
+ * An org is Epic/Care Everywhere-capable if its capabilities.channels
+ * (stored as a text[] column "channels") includes 'cloud'.
+ */
+export function isEpicOrg(org: { channels?: string[] } | { capabilities?: { channels?: string[] } }): boolean {
+  const channelArr =
+    ('channels' in org && Array.isArray(org.channels))
+      ? org.channels
+      : ('capabilities' in org && Array.isArray(org.capabilities?.channels))
+        ? (org.capabilities?.channels ?? [])
+        : [];
+  return channelArr.includes('cloud');
+}
+
+// ---------------------------------------------------------------------------
+// buildChannelPlan — new step-based plan with W1b resolution rules
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an ordered chase ladder.
  *
- * Rules (per spec):
- * - Start with preferred_channel.
- * - If preferred is 'portal' → plan is ['portal'] only.
- * - Otherwise, append the rest of [fax, email, sms, voice] only where the
- *   org has the corresponding contact field.
- * - override forces that channel first, followed by the normal remainder.
- * - waitSeconds defaults 30, clamped 10–120.
+ * Resolution order (per workflow1b-revision.md §1):
+ *  1. Epic org (capabilities.channels includes 'cloud') → [{channel:'care_everywhere',attempt:1}]
+ *  2. Org contact.chase_policy.steps if present
+ *  3. Agent config.chase_policy.steps if present
+ *  4. Default ['fax','fax','voice']
+ *
+ * Channel override forces the first step regardless (unless care_everywhere).
+ * Steps whose channel has no org contact info are skipped.
+ * waitSeconds clamped 10–120.
  */
 export function buildChannelPlan(
   org: {
+    channels?: string[];
     contact?: {
       fax?: string;
       email?: string;
       phone?: string;
       preferred_channel?: string;
+      chase_policy?: { steps?: string[]; waitSeconds?: number };
     };
+  },
+  agentConfig?: {
+    chase_policy?: { steps?: string[]; waitSeconds?: number };
   },
   override?: Channel,
   waitSeconds?: number,
-): ChannelPlan {
-  const wait = Math.min(120, Math.max(10, waitSeconds ?? 30));
+): ChasePlan {
   const contact = org.contact ?? {};
-  const preferred = (contact.preferred_channel ?? 'fax') as Channel;
 
-  // Portal orgs: single step, no chase
-  if (preferred === 'portal' && !override) {
-    return { channels: ['portal'], waitSeconds: wait };
+  // --- Step 1: Epic/Care Everywhere orgs ---
+  if (isEpicOrg(org) && !override) {
+    const wait = Math.min(120, Math.max(10, waitSeconds ?? 30));
+    return {
+      steps: [{ channel: 'care_everywhere', attempt: 1 }],
+      waitSeconds: wait,
+    };
   }
 
-  // Build ordered list: start with preferred, then add the rest in canonical order
-  const canonical: Channel[] = ['fax', 'email', 'sms', 'voice'];
+  // --- Determine raw step list from policy hierarchy ---
+  const orgPolicy = contact.chase_policy;
+  const agentPolicy = agentConfig?.chase_policy;
+
+  const rawSteps: string[] =
+    orgPolicy?.steps?.length
+      ? orgPolicy.steps
+      : agentPolicy?.steps?.length
+        ? agentPolicy.steps
+        : ['fax', 'fax', 'voice'];
+
+  const policyWait =
+    orgPolicy?.waitSeconds ??
+    agentPolicy?.waitSeconds ??
+    waitSeconds ??
+    30;
+
+  const wait = Math.min(120, Math.max(10, policyWait));
 
   // Channels the org actually has contact info for
   const hasChannel: Record<string, boolean> = {
@@ -87,44 +146,61 @@ export function buildChannelPlan(
     email: !!contact.email,
     sms: !!contact.phone,
     voice: !!contact.phone,
+    portal: true, // portal never skipped by contact info but filtered later
+    care_everywhere: true,
   };
 
-  let ordered: Channel[] = [];
-
-  if (override) {
-    // Override channel goes first, then normal remainder (without override)
-    ordered.push(override);
-    if (preferred !== override && hasChannel[preferred]) {
-      ordered.push(preferred);
-    }
-    for (const ch of canonical) {
-      if (ch !== override && ch !== preferred && hasChannel[ch]) {
-        ordered.push(ch);
-      }
-    }
-  } else {
-    // Preferred first
-    if (hasChannel[preferred]) {
-      ordered.push(preferred);
-    }
-    for (const ch of canonical) {
-      if (ch !== preferred && hasChannel[ch]) {
-        ordered.push(ch);
-      }
-    }
+  // If override is set, prepend it and skip the normal first step
+  let effectiveRaw = rawSteps;
+  if (override && override !== 'care_everywhere') {
+    // Replace only the first element if it matches or prepend
+    effectiveRaw = [override, ...rawSteps.filter((_, i) => i > 0 || rawSteps[0] !== override)];
   }
 
-  // Deduplicate while preserving order
+  // Expand raw strings into ChaseStep[], tracking per-channel attempt counters
+  // and skipping steps with no org contact info (except override which forces inclusion)
+  const channelAttemptCounter: Record<string, number> = {};
+  const steps: ChaseStep[] = [];
+
+  for (const rawCh of effectiveRaw) {
+    const ch = rawCh as Channel;
+    // Skip portal in outgoing plans (no longer an outbound channel)
+    if (ch === 'portal') continue;
+    // Skip if org lacks contact info for this channel (but allow override or care_everywhere)
+    if (ch !== override && !hasChannel[ch]) continue;
+
+    channelAttemptCounter[ch] = (channelAttemptCounter[ch] ?? 0) + 1;
+    steps.push({ channel: ch, attempt: channelAttemptCounter[ch] });
+  }
+
+  // Fallback: if all steps were skipped, use fax
+  if (steps.length === 0) {
+    steps.push({ channel: 'fax', attempt: 1 });
+  }
+
+  return { steps, waitSeconds: wait };
+}
+
+/**
+ * Legacy compat: return the legacy ChannelPlan shape (deduped channels list).
+ * Used by any remaining code that calls buildChannelPlan and reads .channels.
+ */
+export function buildChannelPlanLegacy(
+  org: Parameters<typeof buildChannelPlan>[0],
+  agentConfig?: Parameters<typeof buildChannelPlan>[1],
+  override?: Channel,
+  waitSeconds?: number,
+): ChannelPlan {
+  const plan = buildChannelPlan(org, agentConfig, override, waitSeconds);
   const seen = new Set<Channel>();
-  const deduped: Channel[] = [];
-  for (const ch of ordered) {
-    if (!seen.has(ch)) {
-      seen.add(ch);
-      deduped.push(ch);
+  const channels: Channel[] = [];
+  for (const step of plan.steps) {
+    if (!seen.has(step.channel)) {
+      seen.add(step.channel);
+      channels.push(step.channel);
     }
   }
-
-  return { channels: deduped.length > 0 ? deduped : ['fax'], waitSeconds: wait };
+  return { channels: channels.length ? channels : ['fax'], waitSeconds: plan.waitSeconds };
 }
 
 // ---------------------------------------------------------------------------
@@ -152,9 +228,95 @@ export function renderOutboundDocument(
       return renderVoice(kind, ctx, refNo, attemptNo);
     case 'portal':
       return renderPortal(kind, ctx, refNo, dateStr);
+    case 'care_everywhere':
+      return renderCareEverywhere(kind, ctx, refNo, dateStr);
     default:
       return renderFax(kind, ctx, refNo, dateStr, attemptNo, isRepeat);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Care Everywhere — structured C-CDA query document
+// ---------------------------------------------------------------------------
+
+function renderCareEverywhere(
+  kind: DocumentKind,
+  ctx: OutboundContext,
+  refNo: string,
+  dateStr: string,
+): RenderedDocument {
+  if (kind === 'records_response') {
+    // Simulated C-CDA return document
+    const doc = [
+      '================================================================================',
+      '              CARE EVERYWHERE — DOCUMENT RETURN (C-CDA summary)                ',
+      '================================================================================',
+      '',
+      `Date:           ${dateStr}`,
+      `From:           ${ctx.orgName} — Epic Care Everywhere Exchange`,
+      `To:             CE 2.0 Network Console`,
+      `Ref #:          ${refNo}`,
+      `Exchange:       Epic Care Everywhere (cloud)`,
+      '',
+      `Patient:        ${ctx.patientName}`,
+      ...(ctx.patientDob ? [`DOB:            ${ctx.patientDob}`] : []),
+      ...(ctx.patientMrn ? [`MRN:            ${ctx.patientMrn}`] : []),
+      '',
+      'Document Type:  C-CDA Continuity of Care Document (CCD)',
+      'Format:         HL7 CDA Release 2',
+      '',
+      'SUMMARY OF TRANSMITTED RECORDS:',
+      '  • Active Problem List',
+      '  • Medications (current)',
+      '  • Allergies and Adverse Reactions',
+      '  • Lab Results (last 12 months)',
+      '  • Immunization History',
+      '  • Vital Signs (last visit)',
+      ...(ctx.recordsRequested ? [``, `  Originally requested: ${ctx.recordsRequested}`] : []),
+      '',
+      'STATUS: Complete — all available records transmitted via Care Everywhere.',
+      '',
+      `Ref: ${refNo}`,
+      '================================================================================',
+    ].join('\n');
+
+    const subject = `Care Everywhere Return — ${ctx.patientName} (ref ${refNo})`;
+    const body = `C-CDA document return for ${ctx.patientName} via Care Everywhere — ref ${refNo}. Records complete.`;
+    return { subject, body, document: doc };
+  }
+
+  // records_request — structured Care Everywhere query
+  const doc = [
+    '================================================================================',
+    '                  CARE EVERYWHERE — RECORD QUERY                                ',
+    '================================================================================',
+    '',
+    `Date:           ${dateStr}`,
+    `From:           CE 2.0 Network Console`,
+    `To:             ${ctx.orgName} — Epic Care Everywhere Exchange`,
+    `Ref #:          ${refNo}`,
+    `Exchange:       Epic Care Everywhere (cloud — structured exchange)`,
+    '',
+    '--- PATIENT DEMOGRAPHICS ---',
+    `Patient:        ${ctx.patientName}`,
+    ...(ctx.patientDob ? [`DOB:            ${ctx.patientDob}`] : []),
+    ...(ctx.patientMrn ? [`MRN:            ${ctx.patientMrn}`] : []),
+    '',
+    '--- RECORDS REQUESTED ---',
+    ctx.recordsRequested
+      ? `Records:        ${ctx.recordsRequested}`
+      : 'Records:        All available (C-CDA Continuity of Care Document)',
+    '',
+    'Exchange type:  Structured — instant, no fax required.',
+    'Expected response: C-CDA document return via Care Everywhere.',
+    '',
+    `Ref: ${refNo}`,
+    '================================================================================',
+  ].join('\n');
+
+  const subject = `Care Everywhere Query — ${ctx.patientName} (ref ${refNo})`;
+  const body = `Structured Care Everywhere record query for ${ctx.patientName} — ref ${refNo}. Awaiting C-CDA return.`;
+  return { subject, body, document: doc };
 }
 
 // ---------------------------------------------------------------------------
@@ -219,7 +381,7 @@ function renderFax(
     ``,
     `Sincerely,`,
     `CE 2.0 Medical Records Team`,
-    `================================================================================`,
+    '================================================================================',
   ]
     .join('\n')
     .replace(/\n\n\n+/g, '\n\n');
@@ -333,7 +495,7 @@ function renderVoice(
 }
 
 // ---------------------------------------------------------------------------
-// Portal (in-network)
+// Portal (legacy — kept for backward compat; no longer in new plans)
 // ---------------------------------------------------------------------------
 
 function renderPortal(
@@ -383,6 +545,39 @@ export function renderRecordsTransmittal(ctx: {
 }): string {
   const date = ctx.dateStr ?? formatDate(new Date());
   const pageCount = 3 + Math.floor(pseudoRandom(ctx.refNo) * 8); // 3–10 pages, deterministic per ref
+
+  if (ctx.channel === 'care_everywhere') {
+    // Care Everywhere response is a C-CDA return
+    return [
+      '================================================================================',
+      '              CARE EVERYWHERE — DOCUMENT RETURN (C-CDA summary)                ',
+      '================================================================================',
+      '',
+      `Date:           ${date}`,
+      `From:           ${ctx.orgName} — Epic Care Everywhere Exchange`,
+      `To:             CE 2.0 Network Console`,
+      `Ref #:          ${ctx.refNo}`,
+      '',
+      `Patient:        ${ctx.patientName}`,
+      ...(ctx.patientDob ? [`DOB:            ${ctx.patientDob}`] : []),
+      '',
+      'Document Type:  C-CDA Continuity of Care Document (CCD)',
+      'Format:         HL7 CDA Release 2',
+      '',
+      'SUMMARY OF TRANSMITTED RECORDS:',
+      '  • Active Problem List',
+      '  • Medications (current)',
+      '  • Allergies and Adverse Reactions',
+      '  • Lab Results (last 12 months)',
+      '  • Immunization History',
+      '  • Vital Signs (last visit)',
+      '',
+      'STATUS: Complete — all available records transmitted via Care Everywhere.',
+      '',
+      `Ref: ${ctx.refNo}`,
+      '================================================================================',
+    ].join('\n');
+  }
 
   return [
     '================================================================================',

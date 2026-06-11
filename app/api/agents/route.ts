@@ -22,6 +22,7 @@ export async function POST(req: NextRequest) {
     confidence_threshold?: number;
     model?: string;
     mode?: string;
+    config?: Record<string, unknown>;
   };
 
   try {

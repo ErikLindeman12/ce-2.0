@@ -20,6 +20,7 @@ interface OrgContact {
   email?: string;
   phone?: string;
   preferred_channel?: string;
+  chase_policy?: { steps: string[]; waitSeconds: number };
 }
 
 interface OrgResult {
@@ -30,80 +31,157 @@ interface OrgResult {
   capabilities?: { channels?: string[] };
 }
 
-type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal';
-type ChannelOverride = 'auto' | OutboundChannel;
+type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'care_everywhere';
+type ChannelOverride = 'auto' | 'fax' | 'email' | 'sms' | 'voice';
 
 const WAIT_OPTIONS = [10, 20, 30, 60] as const;
 type WaitSeconds = (typeof WAIT_OPTIONS)[number];
+
+// A chase step with repeat labeling
+interface ChaseStep {
+  channel: OutboundChannel;
+  attempt: number; // 1-based per channel
+}
 
 // ---------------------------------------------------------------------------
 // Channel helpers
 // ---------------------------------------------------------------------------
 
 const CHANNEL_ICONS: Record<string, string> = {
-  fax:    '📠',
-  email:  '✉️',
-  sms:    '💬',
-  voice:  '📞',
-  portal: '🌐',
+  fax:            '📠',
+  email:          '✉️',
+  sms:            '💬',
+  voice:          '📞',
+  care_everywhere:'⚡',
 };
 
 const CHANNEL_LABELS: Record<string, string> = {
-  fax:    'Fax',
-  email:  'Email',
-  sms:    'SMS',
-  voice:  'Voice',
-  portal: 'In-app',
+  fax:            'Fax',
+  email:          'Secure Email',
+  sms:            'SMS',
+  voice:          'Voice',
+  care_everywhere:'Care Everywhere',
 };
 
-/** Mirrors buildChannelPlan from lib/outbound.ts */
-function buildClientChannelPlan(
+function isEpicOrg(org: OrgResult | null): boolean {
+  return !!(org?.capabilities?.channels?.includes('cloud'));
+}
+
+/** Expand flat channel strings to ChaseStep[] with attempt counters per channel. */
+function expandSteps(rawSteps: string[]): ChaseStep[] {
+  const counts: Record<string, number> = {};
+  return rawSteps.map((ch) => {
+    counts[ch] = (counts[ch] ?? 0) + 1;
+    return { channel: ch as OutboundChannel, attempt: counts[ch] };
+  });
+}
+
+/** Contact info check: does the org have what we need for this channel? */
+function hasContactFor(ch: string, contact: OrgContact): boolean {
+  if (ch === 'fax')   return !!contact.fax;
+  if (ch === 'email') return !!contact.email;
+  if (ch === 'sms')   return !!contact.phone;
+  if (ch === 'voice') return !!contact.phone;
+  return true;
+}
+
+/**
+ * Mirrors buildChannelPlan from lib/outbound.ts per the W1b spec.
+ * Returns ChaseStep[] (steps, possibly with repeats).
+ * agentChasePolicySteps = Records Chaser's config.chase_policy.steps fetched from /api/agents.
+ */
+function buildClientChasePlan(
   org: OrgResult | null,
   override: ChannelOverride,
-): OutboundChannel[] {
+  agentChasePolicySteps: string[] | null,
+): ChaseStep[] {
   if (!org) return [];
-  const contact = org.contact ?? {};
-  const preferred = (contact.preferred_channel ?? 'fax') as OutboundChannel;
 
-  if (preferred === 'portal') return ['portal'];
-
-  const available: OutboundChannel[] = [];
-  if (contact.fax)   available.push('fax');
-  if (contact.email) available.push('email');
-  if (contact.phone) available.push('sms');
-  if (contact.phone) available.push('voice');
-
-  if (override !== 'auto') {
-    const rest = available.filter((c) => c !== override);
-    return [override, ...rest];
+  // 1. Care Everywhere → single step
+  if (isEpicOrg(org)) {
+    return [{ channel: 'care_everywhere', attempt: 1 }];
   }
 
-  const rest = available.filter((c) => c !== preferred);
-  return [preferred, ...rest];
+  const contact = org.contact ?? {};
+
+  // Determine base step list from policy hierarchy
+  let rawSteps: string[];
+
+  if (contact.chase_policy?.steps?.length) {
+    rawSteps = contact.chase_policy.steps;
+  } else if (agentChasePolicySteps && agentChasePolicySteps.length > 0) {
+    rawSteps = agentChasePolicySteps;
+  } else {
+    rawSteps = ['fax', 'fax', 'voice'];
+  }
+
+  // Channel override forces first step
+  if (override !== 'auto') {
+    rawSteps = [override, ...rawSteps.filter((s) => s !== override)];
+  }
+
+  // Skip steps lacking contact info
+  rawSteps = rawSteps.filter((ch) => hasContactFor(ch, contact));
+
+  return expandSteps(rawSteps);
 }
 
 // ---------------------------------------------------------------------------
-// Client-side document preview (mirrors renderOutboundDocument fax layout)
+// Client-side document preview
 // ---------------------------------------------------------------------------
 
 function buildDocumentPreview(
-  channel: OutboundChannel,
+  step: ChaseStep | null,
   patient: Patient | null,
   org: OrgResult | null,
   recordsRequested: string,
   waitSeconds: number,
 ): string {
-  if (!patient || !org) return '';
+  if (!patient || !org || !step) return '';
 
   const today = new Date().toLocaleDateString('en-US', {
     month: 'long', day: 'numeric', year: 'numeric',
   });
-  const itemRef = 'ROI-????????';  // placeholder before creation
+  const itemRef = 'ROI-????????';
+
+  const { channel, attempt } = step;
+
+  if (channel === 'care_everywhere') {
+    return [
+      '══════════════════════════════════════════════════════',
+      '       CARE EVERYWHERE — RECORD QUERY              ',
+      '══════════════════════════════════════════════════════',
+      '',
+      `From:       Epic Health System (Care Everywhere Network)`,
+      `To:         ${org.name}`,
+      `Date:       ${today}`,
+      `Ref:        ${itemRef}`,
+      `Channel:    C-CDA Structured Exchange`,
+      '',
+      '── Patient Demographics ──────────────────────────────',
+      `  Name:     ${patient.firstName} ${patient.lastName}`,
+      `  DOB:      ${patient.dob}`,
+      `  MRN:      ${patient.mrn}`,
+      '',
+      '── Requested Records ─────────────────────────────────',
+      `  ${recordsRequested || '(specify records above)'}`,
+      '',
+      '── Authorization ─────────────────────────────────────',
+      '  Patient authorization on file per HIPAA §164.524.',
+      '',
+      '══════════════════════════════════════════════════════',
+      '  Structured exchange — auto-response expected ~8s.   ',
+      '══════════════════════════════════════════════════════',
+    ].join('\n');
+  }
 
   if (channel === 'fax') {
+    const isSecondRequest = attempt >= 2;
     return [
       '═══════════════════════════════════════════════',
-      '         *** FACSIMILE COVER SHEET ***          ',
+      isSecondRequest
+        ? '    *** SECOND REQUEST — FACSIMILE COVER SHEET ***   '
+        : '         *** FACSIMILE COVER SHEET ***          ',
       '═══════════════════════════════════════════════',
       '',
       `TO:      ${org.name}`,
@@ -113,6 +191,7 @@ function buildDocumentPreview(
       `RE:      Records Request — ${patient.firstName} ${patient.lastName}`,
       `PAGES:   1 (cover sheet only)`,
       `REF:     ${itemRef}`,
+      ...(isSecondRequest ? ['', 'NOTE:    This is our SECOND REQUEST. No response received.'] : []),
       '',
       '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━',
       'CONFIDENTIALITY NOTICE',
@@ -143,11 +222,11 @@ function buildDocumentPreview(
 
   if (channel === 'email') {
     return [
-      `Subject: Records Request — ${patient.firstName} ${patient.lastName} (ref ${itemRef})`,
+      `Subject: [Secure] Records Request — ${patient.firstName} ${patient.lastName} (ref ${itemRef})`,
       '',
       `Dear ${org.name} Health Information Team,`,
       '',
-      `We are writing to request medical records for the following patient:`,
+      `We are writing via secure email to request medical records for the following patient:`,
       '',
       `  Name:    ${patient.firstName} ${patient.lastName}`,
       `  DOB:     ${patient.dob}`,
@@ -158,7 +237,7 @@ function buildDocumentPreview(
       `Please respond within ${waitSeconds} seconds (system-assisted request).`,
       `Reference number: ${itemRef}`,
       '',
-      'Thank you for your prompt attention.',
+      'This message was transmitted via secure encrypted channel.',
       '',
       'Epic Health System — ROI Coordinator',
     ].join('\n');
@@ -182,26 +261,6 @@ function buildDocumentPreview(
       ` Our reference number is ${itemRef}.`,
       ` Please return our call or fax records to us.`,
       ` Thank you and have a great day."`,
-    ].join('\n');
-  }
-
-  if (channel === 'portal') {
-    return [
-      'PORTAL DELIVERY',
-      '───────────────',
-      `This request will be delivered directly to`,
-      `${org.name} via the secure provider portal.`,
-      '',
-      `Patient: ${patient.firstName} ${patient.lastName}`,
-      `DOB:     ${patient.dob}`,
-      `MRN:     ${patient.mrn}`,
-      '',
-      `Records: ${recordsRequested || '(specify above)'}`,
-      '',
-      `Ref: ${itemRef}`,
-      '',
-      `No fax required — the organization will respond`,
-      `in-app. There is no automatic chase timeout.`,
     ].join('\n');
   }
 
@@ -236,61 +295,68 @@ function PatientCard({ patient }: { patient: Patient }) {
 
 function OrgCapabilityCard({
   org,
-  plan,
-  override,
+  steps,
 }: {
   org: OrgResult;
-  plan: OutboundChannel[];
-  override: ChannelOverride;
+  steps: ChaseStep[];
 }) {
   const contact = org.contact ?? {};
-  const preferred = (contact.preferred_channel ?? 'fax') as OutboundChannel;
-  const isPortal = preferred === 'portal';
+  const isCE = isEpicOrg(org);
 
-  const channelPresence: { ch: OutboundChannel; label: string }[] = [];
+  const channelPresence: { ch: string; label: string }[] = [];
   if (contact.fax)   channelPresence.push({ ch: 'fax',   label: contact.fax });
   if (contact.email) channelPresence.push({ ch: 'email', label: contact.email });
-  if (contact.phone) channelPresence.push({ ch: 'sms',   label: contact.phone });
   if (contact.phone) channelPresence.push({ ch: 'voice', label: contact.phone });
-  if (isPortal)      channelPresence.push({ ch: 'portal', label: 'In-app' });
 
   return (
     <div
       style={{
         padding: '14px 16px',
-        background: isPortal ? 'var(--color-portal-bg)' : '#f0fdf4',
-        border: `1.5px solid ${isPortal ? 'var(--color-portal-subtle)' : '#6ee7b7'}`,
+        background: isCE ? '#eef2ff' : '#f0fdf4',
+        border: `1.5px solid ${isCE ? 'var(--color-accent-subtle)' : '#6ee7b7'}`,
         borderRadius: 'var(--radius)',
         marginTop: '6px',
       }}
     >
-      {/* Header row */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: '8px', marginBottom: '10px' }}>
         <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{org.name}</div>
-        {isPortal && (
+        {isCE && (
           <span
-            className="badge badge-portal"
-            style={{ fontSize: '0.72rem' }}
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: '5px',
+              padding: '3px 10px',
+              borderRadius: '99px',
+              fontSize: '0.72rem',
+              fontWeight: 700,
+              background: '#4f46e5',
+              color: '#fff',
+              letterSpacing: '0.02em',
+            }}
           >
-            🌐 On network — delivered in-app
+            ⚡ Epic · Care Everywhere
           </span>
         )}
       </div>
 
-      {/* Channel chips */}
-      {channelPresence.length > 0 && (
+      {isCE && (
+        <div style={{ fontSize: '0.78rem', color: 'var(--color-accent)', marginTop: '2px' }}>
+          Structured exchange — instant, no fax
+        </div>
+      )}
+
+      {!isCE && channelPresence.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '8px' }}>
           {channelPresence.map(({ ch }) => {
-            const isPreferred = ch === preferred || (isPortal && ch === 'portal');
-            const isInPlan = override === 'auto' ? plan.includes(ch) : override === ch;
+            const inPlan = steps.some((s) => s.channel === ch);
             return (
               <span
                 key={ch}
-                className={`chip${isPreferred ? ' preferred' : ''}${ch === 'portal' ? ' portal-chip' : ''}`}
+                className={`chip${inPlan ? ' preferred' : ''}`}
               >
                 {CHANNEL_ICONS[ch]} {CHANNEL_LABELS[ch]}
-                {isPreferred && <span style={{ marginLeft: '3px' }}>★</span>}
-                {!isInPlan && !isPreferred && (
+                {!inPlan && (
                   <span style={{ opacity: 0.5, marginLeft: '2px', fontSize: '0.65rem' }}>skipped</span>
                 )}
               </span>
@@ -298,37 +364,48 @@ function OrgCapabilityCard({
           })}
         </div>
       )}
-
-      {isPortal && (
-        <div style={{ fontSize: '0.78rem', color: 'var(--color-portal)', marginTop: '2px' }}>
-          Delivered in-app — no fax required. No timeout chase.
-        </div>
-      )}
     </div>
   );
 }
 
+/** Render a step label like "📠 Fax (1st)" or "📠 Fax (2nd)" or just "📠 Fax" when no repeats */
+function stepLabel(step: ChaseStep, hasRepeats: boolean): string {
+  const icon = CHANNEL_ICONS[step.channel] ?? '';
+  const label = CHANNEL_LABELS[step.channel] ?? step.channel;
+  if (!hasRepeats || step.channel === 'care_everywhere') return `${icon} ${label}`;
+  const ordinals = ['1st', '2nd', '3rd', '4th'];
+  const ord = ordinals[step.attempt - 1] ?? `${step.attempt}th`;
+  return `${icon} ${label} (${ord})`;
+}
+
 function ChannelPlanStepper({
-  plan,
+  steps,
   waitSeconds,
 }: {
-  plan: OutboundChannel[];
+  steps: ChaseStep[];
   waitSeconds: number;
 }) {
-  if (plan.length === 0) return null;
+  if (steps.length === 0) return null;
+
+  const channelRepeatCounts: Record<string, number> = {};
+  for (const s of steps) {
+    channelRepeatCounts[s.channel] = (channelRepeatCounts[s.channel] ?? 0) + 1;
+  }
+  const hasAnyRepeat = Object.values(channelRepeatCounts).some((c) => c > 1);
+
+  const isCE = steps.length === 1 && steps[0].channel === 'care_everywhere';
 
   return (
     <div>
       <div className="section-label" style={{ marginBottom: '8px' }}>Channel Plan</div>
       <div className="stepper">
-        {plan.map((ch, i) => (
-          <span key={ch} style={{ display: 'inline-flex', alignItems: 'center' }}>
+        {steps.map((s, i) => (
+          <span key={i} style={{ display: 'inline-flex', alignItems: 'center' }}>
             <span className="stepper-step" style={{ fontSize: '0.80rem' }}>
               <span>{i + 1}</span>
-              <span>{CHANNEL_ICONS[ch]}</span>
-              <span>{CHANNEL_LABELS[ch]}</span>
+              <span>{stepLabel(s, hasAnyRepeat)}</span>
             </span>
-            {i < plan.length - 1 && (
+            {i < steps.length - 1 && (
               <span className="stepper-arrow">
                 &nbsp;→ wait {waitSeconds}s →&nbsp;
               </span>
@@ -336,9 +413,9 @@ function ChannelPlanStepper({
           </span>
         ))}
       </div>
-      {plan.length === 1 && plan[0] === 'portal' && (
-        <div style={{ fontSize: '0.77rem', color: 'var(--color-portal)', marginTop: '6px' }}>
-          Portal orgs receive a single in-app delivery with no escalation chain.
+      {isCE && (
+        <div style={{ fontSize: '0.77rem', color: 'var(--color-accent)', marginTop: '6px' }}>
+          Care Everywhere orgs receive a single structured query with no escalation chain.
         </div>
       )}
     </div>
@@ -346,19 +423,20 @@ function ChannelPlanStepper({
 }
 
 function DocumentPreview({
-  channel,
+  step,
   patient,
   org,
   recordsRequested,
   waitSeconds,
 }: {
-  channel: OutboundChannel;
+  step: ChaseStep | null;
   patient: Patient | null;
   org: OrgResult | null;
   recordsRequested: string;
   waitSeconds: number;
 }) {
-  const text = buildDocumentPreview(channel, patient, org, recordsRequested, waitSeconds);
+  const text = buildDocumentPreview(step, patient, org, recordsRequested, waitSeconds);
+  const channel = step?.channel ?? 'fax';
 
   if (!text) {
     return (
@@ -412,6 +490,9 @@ export default function RoiNewPage() {
   const [orgsLoading, setOrgsLoading] = useState(false);
   const [selectedOrg, setSelectedOrg] = useState<OrgResult | null>(null);
 
+  // Records Chaser agent config (fetched once)
+  const [agentChasePolicySteps, setAgentChasePolicySteps] = useState<string[] | null>(null);
+
   // Form fields
   const [recordsRequested, setRecordsRequested] = useState('');
   const [channelOverride, setChannelOverride] = useState<ChannelOverride>('auto');
@@ -452,6 +533,38 @@ export default function RoiNewPage() {
   }, []);
 
   // ---------------------------------------------------------------------------
+  // Load Records Chaser config (for plan preview fallback)
+  // ---------------------------------------------------------------------------
+
+  useEffect(() => {
+    async function loadAgents() {
+      try {
+        const res = await fetch('/api/agents', { cache: 'no-store' });
+        if (!res.ok) return;
+        const body = (await res.json()) as
+          | { data: Array<Record<string, unknown>> }
+          | Array<Record<string, unknown>>;
+        const agents = Array.isArray(body) ? body : ((body as { data: Array<Record<string, unknown>> }).data ?? []);
+        // Find the ROI outgoing / Records Chaser agent
+        const chaser = agents.find((a) => {
+          const qk = (a.queue_key ?? a.queueKey) as string | undefined;
+          return qk === 'roi_outgoing';
+        });
+        if (chaser) {
+          const cfg = (chaser.config as Record<string, unknown> | undefined) ?? {};
+          const policy = cfg.chase_policy as { steps?: string[] } | undefined;
+          if (policy?.steps?.length) {
+            setAgentChasePolicySteps(policy.steps);
+          }
+        }
+      } catch {
+        // non-critical — fall back to default ladder
+      }
+    }
+    void loadAgents();
+  }, []);
+
+  // ---------------------------------------------------------------------------
   // Debounced org search
   // ---------------------------------------------------------------------------
 
@@ -477,8 +590,9 @@ export default function RoiNewPage() {
   // ---------------------------------------------------------------------------
 
   const selectedPatient = patients.find((p) => p.id === selectedPatientId) ?? null;
-  const channelPlan = buildClientChannelPlan(selectedOrg, channelOverride);
-  const previewChannel = channelPlan[0] ?? 'fax';
+  const chasePlan = buildClientChasePlan(selectedOrg, channelOverride, agentChasePolicySteps);
+  const previewStep = chasePlan[0] ?? null;
+  const isCE = isEpicOrg(selectedOrg);
 
   // ---------------------------------------------------------------------------
   // Submit
@@ -566,7 +680,7 @@ export default function RoiNewPage() {
             <label className="section-label" style={{ marginBottom: '4px' }}>Organization</label>
             {selectedOrg ? (
               <>
-                <OrgCapabilityCard org={selectedOrg} plan={channelPlan} override={channelOverride} />
+                <OrgCapabilityCard org={selectedOrg} steps={chasePlan} />
                 <button
                   type="button"
                   onClick={() => { setSelectedOrg(null); setOrgQuery(''); }}
@@ -600,7 +714,7 @@ export default function RoiNewPage() {
                     }}
                   >
                     {orgs.map((org) => {
-                      const isPortal = org.contact?.preferred_channel === 'portal';
+                      const isEpic = isEpicOrg(org);
                       return (
                         <button
                           key={org.id}
@@ -622,12 +736,25 @@ export default function RoiNewPage() {
                           onMouseLeave={(e) => { (e.currentTarget as HTMLButtonElement).style.background = 'none'; }}
                         >
                           <span style={{ fontWeight: 600 }}>{org.name}</span>
-                          {isPortal && (
-                            <span className="badge badge-portal" style={{ marginLeft: '8px', fontSize: '0.68rem' }}>
-                              🌐 Portal
+                          {isEpic && (
+                            <span
+                              style={{
+                                marginLeft: '8px',
+                                display: 'inline-flex',
+                                alignItems: 'center',
+                                gap: '3px',
+                                padding: '1px 7px',
+                                borderRadius: '99px',
+                                fontSize: '0.68rem',
+                                fontWeight: 700,
+                                background: '#4f46e5',
+                                color: '#fff',
+                              }}
+                            >
+                              ⚡ CE
                             </span>
                           )}
-                          {!isPortal && org.contact?.preferred_channel && (
+                          {!isEpic && org.contact?.preferred_channel && (
                             <span style={{ color: 'var(--color-ink-faint)', marginLeft: '8px', fontSize: '0.76rem' }}>
                               preferred: {org.contact.preferred_channel}
                             </span>
@@ -659,66 +786,64 @@ export default function RoiNewPage() {
             />
           </div>
 
-          {/* 4. Channel override */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            <label className="section-label" style={{ marginBottom: '4px' }}>Channel Override</label>
-            <select
-              className="select"
-              value={channelOverride}
-              onChange={(e) => setChannelOverride(e.target.value as ChannelOverride)}
-            >
-              <option value="auto">Auto — use org preferred</option>
-              <option value="fax">📠 Fax</option>
-              <option value="email">✉️ Email</option>
-              <option value="sms">💬 SMS</option>
-              <option value="voice">📞 Voice</option>
-              <option value="portal">🌐 Portal</option>
-            </select>
-            <div style={{ fontSize: '0.76rem', color: 'var(--color-ink-faint)' }}>
-              Leave as Auto to follow the org&apos;s preferred channel escalation plan.
+          {/* 4. Channel override — hidden for CE orgs */}
+          {!isCE && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <label className="section-label" style={{ marginBottom: '4px' }}>Channel Override</label>
+              <select
+                className="select"
+                value={channelOverride}
+                onChange={(e) => setChannelOverride(e.target.value as ChannelOverride)}
+              >
+                <option value="auto">Auto — follow org chase policy</option>
+                <option value="fax">📠 Fax</option>
+                <option value="email">✉️ Secure Email</option>
+                <option value="sms">💬 SMS</option>
+                <option value="voice">📞 Voice</option>
+              </select>
+              <div style={{ fontSize: '0.76rem', color: 'var(--color-ink-faint)' }}>
+                Leave as Auto to follow the org&apos;s configured escalation ladder.
+              </div>
             </div>
-          </div>
+          )}
 
-          {/* 5. Wait dial */}
-          <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-            <label className="section-label" style={{ marginBottom: '4px' }}>Response Wait Time</label>
-            <div style={{ display: 'flex', gap: '6px' }}>
-              {WAIT_OPTIONS.map((s) => (
-                <button
-                  key={s}
-                  type="button"
-                  onClick={() => setWaitSeconds(s)}
-                  style={{
-                    flex: 1,
-                    padding: '8px 0',
-                    border: `2px solid ${waitSeconds === s ? 'var(--color-accent)' : 'var(--color-border)'}`,
-                    borderRadius: 'var(--radius-sm)',
-                    background: waitSeconds === s ? 'var(--color-accent-light)' : 'var(--color-surface)',
-                    color: waitSeconds === s ? 'var(--color-accent)' : 'var(--color-ink-muted)',
-                    fontWeight: 700,
-                    fontSize: '0.84rem',
-                    cursor: 'pointer',
-                    transition: 'all var(--transition)',
-                  }}
-                >
-                  {s}s
-                </button>
-              ))}
+          {/* 5. Wait dial — hidden for CE orgs */}
+          {!isCE && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+              <label className="section-label" style={{ marginBottom: '4px' }}>Response Wait Time</label>
+              <div style={{ display: 'flex', gap: '6px' }}>
+                {WAIT_OPTIONS.map((s) => (
+                  <button
+                    key={s}
+                    type="button"
+                    onClick={() => setWaitSeconds(s)}
+                    style={{
+                      flex: 1,
+                      padding: '8px 0',
+                      border: `2px solid ${waitSeconds === s ? 'var(--color-accent)' : 'var(--color-border)'}`,
+                      borderRadius: 'var(--radius-sm)',
+                      background: waitSeconds === s ? 'var(--color-accent-light)' : 'var(--color-surface)',
+                      color: waitSeconds === s ? 'var(--color-accent)' : 'var(--color-ink-muted)',
+                      fontWeight: 700,
+                      fontSize: '0.84rem',
+                      cursor: 'pointer',
+                      transition: 'all var(--transition)',
+                    }}
+                  >
+                    {s}s
+                  </button>
+                ))}
+              </div>
+              <div style={{ fontSize: '0.76rem', color: 'var(--color-ink-faint)' }}>
+                How long to wait for a response on each channel before escalating.
+              </div>
             </div>
-            <div style={{ fontSize: '0.76rem', color: 'var(--color-ink-faint)' }}>
-              How long to wait for a response on each channel before escalating.
-              {selectedOrg?.contact?.preferred_channel === 'portal' && (
-                <span style={{ color: 'var(--color-portal)', marginLeft: '4px' }}>
-                  Portal orgs have no timeout chase.
-                </span>
-              )}
-            </div>
-          </div>
+          )}
 
-          {/* Channel plan stepper (inside the form) */}
-          {channelPlan.length > 0 && (
+          {/* Channel plan stepper */}
+          {chasePlan.length > 0 && (
             <div className="card" style={{ padding: '14px 16px' }}>
-              <ChannelPlanStepper plan={channelPlan} waitSeconds={waitSeconds} />
+              <ChannelPlanStepper steps={chasePlan} waitSeconds={waitSeconds} />
             </div>
           )}
 
@@ -752,7 +877,7 @@ export default function RoiNewPage() {
         {/* RIGHT — document preview */}
         <div style={{ position: 'sticky', top: '76px' }}>
           <DocumentPreview
-            channel={previewChannel}
+            step={previewStep}
             patient={selectedPatient}
             org={selectedOrg}
             recordsRequested={recordsRequested}

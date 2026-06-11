@@ -30,8 +30,8 @@ export async function PATCH(
     return NextResponse.json({ error: 'Invalid JSON body' }, { status: 400 });
   }
 
-  // Whitelist updatable fields
-  const allowed = ['name', 'enabled', 'instructions', 'tools', 'confidence_threshold', 'model', 'mode'];
+  // Whitelist updatable fields — config is a jsonb passthrough (no stats logic touched)
+  const allowed = ['name', 'enabled', 'instructions', 'tools', 'confidence_threshold', 'model', 'mode', 'config'];
   const updates: Record<string, unknown> = {};
   for (const key of allowed) {
     if (key in body) updates[key] = body[key];

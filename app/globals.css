@@ -861,3 +861,51 @@ button, input, select, textarea {
   color: var(--color-error);
   font-size: 0.80rem;
 }
+
+/* ============================================================
+   W1b — Care Everywhere + escalation ladder additions
+   ============================================================ */
+
+/* Indigo Care Everywhere badge (compose page, org search dropdown) */
+.badge-care-everywhere {
+  background: var(--color-accent);
+  color: #fff;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 9px;
+  border-radius: 99px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+/* Care Everywhere stepper step override — indigo active state */
+.stepper-step.care-everywhere {
+  border-color: var(--color-accent);
+  background: var(--color-accent);
+  color: #fff;
+}
+
+/* Ladder editor chip */
+.ladder-step-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border-strong);
+  border-radius: 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--color-ink);
+}
+
+/* Portal submit form label */
+.portal-form-label {
+  display: block;
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: var(--color-ink-muted);
+  margin-bottom: 5px;
+}

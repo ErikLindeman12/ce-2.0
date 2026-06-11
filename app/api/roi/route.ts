@@ -40,10 +40,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Patient not found' }, { status: 404 });
   }
 
-  // Fetch org + contact
+  // Fetch org + contact + channels (for Epic/Care Everywhere detection)
   const { data: org, error: oErr } = await sb
     .from('organizations')
-    .select('id,name,contact')
+    .select('id,name,contact,channels')
     .eq('id', payload.orgId)
     .single();
 
@@ -51,26 +51,46 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Organization not found' }, { status: 404 });
   }
 
-  const orgContact = (org as { contact: Record<string, string> }).contact ?? {};
-  const orgName = (org as { name: string }).name ?? '';
+  const orgRow = org as {
+    id: string;
+    name: string;
+    contact: Record<string, unknown>;
+    channels: string[];
+  };
+  const orgContact = orgRow.contact ?? {};
+  const orgName = orgRow.name ?? '';
+  const orgChannels = orgRow.channels ?? [];
 
   const p = patient as { id: string; first_name: string; last_name: string; dob: string; mrn: string };
 
-  // Build channel plan
+  // Fetch Records Chaser agent config for chase_policy fallback
+  const { data: agentRow } = await sb
+    .from('agents')
+    .select('config')
+    .eq('name', 'Records Chaser')
+    .single();
+  const agentConfig = (agentRow as { config: Record<string, unknown> } | null)?.config ?? {};
+
+  // Build channel plan (new step-based shape)
   const plan = buildChannelPlan(
-    { contact: orgContact as { fax?: string; email?: string; phone?: string; preferred_channel?: string } },
+    {
+      channels: orgChannels,
+      contact: orgContact as { fax?: string; email?: string; phone?: string; preferred_channel?: string; chase_policy?: { steps?: string[]; waitSeconds?: number } },
+    },
+    agentConfig as { chase_policy?: { steps?: string[]; waitSeconds?: number } },
     payload.channel as import('@/lib/outbound').Channel | undefined,
     payload.waitSeconds,
   );
 
-  const firstChannel = plan.channels[0] as OutboundChannel;
-  const isPortal = firstChannel === 'portal';
+  const firstStep = plan.steps[0];
+  const firstChannel = firstStep.channel as OutboundChannel;
+  const isCareEverywhere = firstChannel === 'care_everywhere';
 
   // Create work item in roi_outgoing
   const item = await createWorkItem({
     type: 'records_request_out',
     queue_key: 'roi_outgoing',
-    source_channel: 'portal',
+    source_channel: 'internal',
     org_id: payload.orgId,
     extracted_data: {
       patient_first_name: p.first_name,
@@ -82,7 +102,7 @@ export async function POST(req: NextRequest) {
     },
   });
 
-  // Set matched patient + agent_state with chase_plan and kind
+  // Set matched patient + agent_state with NEW step-based chase_plan
   await sb
     .from('work_items')
     .update({
@@ -91,7 +111,10 @@ export async function POST(req: NextRequest) {
         attempt_no: 1,
         last_channel: firstChannel,
         kind: 'records_request',
-        chase_plan: { channels: plan.channels, waitSeconds: plan.waitSeconds },
+        chase_plan: {
+          steps: plan.steps,
+          waitSeconds: plan.waitSeconds,
+        },
       },
     })
     .eq('id', item.id);
@@ -104,9 +127,9 @@ export async function POST(req: NextRequest) {
     patientMrn: p.mrn,
     recordsRequested: payload.recordsRequested,
     orgName,
-    orgFax: orgContact['fax'],
-    orgEmail: orgContact['email'],
-    orgPhone: orgContact['phone'],
+    orgFax: orgContact['fax'] as string | undefined,
+    orgEmail: orgContact['email'] as string | undefined,
+    orgPhone: orgContact['phone'] as string | undefined,
     attemptNo: 1,
   };
   const rendered = renderOutboundDocument(
@@ -121,11 +144,17 @@ export async function POST(req: NextRequest) {
     phone: orgContact['phone'],
   };
 
-  // Portal: respond_after = null (never auto-timed-out)
-  const respondAfterSeconds = plan.waitSeconds;
-  const respondAfter = isPortal
-    ? null
-    : new Date(Date.now() + respondAfterSeconds * 1000).toISOString();
+  // care_everywhere: respond_after = now + 8s
+  // portal: respond_after = null (never auto-timed-out)
+  // others: use plan.waitSeconds
+  let respondAfter: string | null;
+  if (isCareEverywhere) {
+    respondAfter = new Date(Date.now() + 8000).toISOString();
+  } else if (firstChannel === 'portal') {
+    respondAfter = null;
+  } else {
+    respondAfter = new Date(Date.now() + plan.waitSeconds * 1000).toISOString();
+  }
 
   const { data: attempt, error: aErr } = await sb
     .from('outbound_attempts')
@@ -168,7 +197,7 @@ export async function POST(req: NextRequest) {
       channel: firstChannel,
       org_id: payload.orgId,
       records_requested: payload.recordsRequested,
-      chase_plan: plan,
+      chase_plan: { steps: plan.steps, waitSeconds: plan.waitSeconds },
     },
   });
 
@@ -179,7 +208,8 @@ export async function POST(req: NextRequest) {
       orgId: payload.orgId,
       channel: firstChannel,
       waitSeconds: plan.waitSeconds,
-      chasePlan: plan.channels,
+      stepCount: plan.steps.length,
+      steps: plan.steps.map((s) => `${s.channel}#${s.attempt}`).join(' → '),
       attemptId: (attempt as { id: string }).id,
     }),
   );

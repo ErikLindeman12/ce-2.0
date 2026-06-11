@@ -8,10 +8,16 @@ import type { WorkItem } from '@/lib/types';
 // Types
 // ---------------------------------------------------------------------------
 
-type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal';
+type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal' | 'care_everywhere';
+
+interface ChaseStep {
+  channel: OutboundChannel;
+  attempt: number;
+}
 
 interface ChasePlan {
-  channels: OutboundChannel[];
+  steps?: ChaseStep[];
+  channels?: OutboundChannel[];
   waitSeconds: number;
 }
 
@@ -37,16 +43,18 @@ const CHANNEL_ICONS: Record<string, string> = {
   phone:          '📞',
   portal:         '🌐',
   direct_message: '✉️',
+  care_everywhere:'⚡',
 };
 
 const CHANNEL_LABELS: Record<string, string> = {
   fax:            'Fax',
-  email:          'Email',
+  email:          'Secure Email',
   sms:            'SMS',
   voice:          'Voice',
   phone:          'Phone',
   portal:         'Portal',
   direct_message: 'DM',
+  care_everywhere:'Care Everywhere',
 };
 
 // ---------------------------------------------------------------------------
@@ -57,50 +65,72 @@ function ChaseProgress({ item }: { item: WorkItemWithAgentState }) {
   const agentState = (item.agent_state ?? {}) as AgentState;
   const plan = agentState.chase_plan;
 
-  // Only render for roi_outgoing items that have a chase_plan
-  if (!plan || !plan.channels || plan.channels.length === 0) {
+  if (!plan) {
     return <span style={{ color: 'var(--color-ink-faint)' }}>—</span>;
   }
 
-  const channels = plan.channels;
+  // Normalize to steps array
+  let steps: ChaseStep[];
+  if (plan.steps && plan.steps.length > 0) {
+    steps = plan.steps;
+  } else if (plan.channels && plan.channels.length > 0) {
+    const counts: Record<string, number> = {};
+    steps = plan.channels.map((ch) => {
+      counts[ch] = (counts[ch] ?? 0) + 1;
+      return { channel: ch, attempt: counts[ch] };
+    });
+  } else {
+    return <span style={{ color: 'var(--color-ink-faint)' }}>—</span>;
+  }
+
   const attemptNo = agentState.attempt_no ?? 0;
   const lastChannel = agentState.last_channel;
-
-  // Derive per-channel state
-  // done = all channels tried + item is done
-  // human_review = all tried + escalated
   const isDone = item.status === 'done';
   const isHumanReview = item.queue_key === 'human_review';
 
+  // Care Everywhere: single step, show icon + label compactly
+  if (steps.length === 1 && steps[0].channel === 'care_everywhere') {
+    const state = isDone ? 'done' : item.status === 'waiting' ? 'active' : 'pending';
+    const color = state === 'done' ? 'var(--color-success)' : state === 'active' ? 'var(--color-warning)' : 'var(--color-ink-faint)';
+    const symbol = state === 'done' ? '✓' : state === 'active' ? '●' : '○';
+    return (
+      <span
+        style={{ display: 'inline-flex', alignItems: 'center', gap: '4px', fontSize: '0.78rem', color, fontWeight: state !== 'pending' ? 700 : 400 }}
+        className={state === 'active' ? 'chase-pulse' : ''}
+        title="Care Everywhere structured exchange"
+      >
+        ⚡ <span style={{ fontSize: '0.68rem' }}>{symbol}</span>
+      </span>
+    );
+  }
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-      {/* Icon strip */}
       <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
-        {channels.map((ch, i) => {
-          const chIdx = i + 1; // 1-based
+        {steps.map((s, i) => {
+          const stepIdx = i + 1;
           let state: 'done' | 'failed' | 'active' | 'pending' = 'pending';
 
           if (isDone || isHumanReview) {
-            // All channels that were tried are marked as failed for human_review, done for done
-            if (chIdx <= attemptNo) {
+            if (stepIdx <= attemptNo) {
               state = isDone ? 'done' : 'failed';
             }
-          } else if (chIdx < attemptNo) {
-            state = 'failed'; // previous attempts timed out / failed
-          } else if (chIdx === attemptNo || (lastChannel === ch && item.status === 'waiting')) {
+          } else if (stepIdx < attemptNo) {
+            state = 'failed';
+          } else if (stepIdx === attemptNo || (lastChannel === s.channel && item.status === 'waiting')) {
             state = 'active';
           }
 
           let color = 'var(--color-ink-faint)';
           let symbol = '○';
-          if (state === 'done')    { color = 'var(--color-success)'; symbol = '✓'; }
-          if (state === 'failed')  { color = 'var(--color-error)';   symbol = '✗'; }
-          if (state === 'active')  { color = 'var(--color-warning)'; symbol = '●'; }
+          if (state === 'done')   { color = 'var(--color-success)'; symbol = '✓'; }
+          if (state === 'failed') { color = 'var(--color-error)';   symbol = '✗'; }
+          if (state === 'active') { color = 'var(--color-warning)'; symbol = '●'; }
 
           return (
             <span
-              key={ch}
-              title={`${chIdx}. ${CHANNEL_LABELS[ch] ?? ch} — ${state}`}
+              key={i}
+              title={`${stepIdx}. ${CHANNEL_LABELS[s.channel] ?? s.channel} — ${state}`}
               style={{
                 display: 'inline-flex',
                 alignItems: 'center',
@@ -111,9 +141,9 @@ function ChaseProgress({ item }: { item: WorkItemWithAgentState }) {
               }}
               className={state === 'active' ? 'chase-pulse' : ''}
             >
-              <span>{CHANNEL_ICONS[ch] ?? '?'}</span>
+              <span>{CHANNEL_ICONS[s.channel] ?? '?'}</span>
               <span style={{ fontSize: '0.68rem' }}>{symbol}</span>
-              {i < channels.length - 1 && (
+              {i < steps.length - 1 && (
                 <span style={{ color: 'var(--color-border-strong)', margin: '0 2px' }}>·</span>
               )}
             </span>
@@ -121,10 +151,9 @@ function ChaseProgress({ item }: { item: WorkItemWithAgentState }) {
         })}
       </div>
 
-      {/* Attempt counter */}
       {attemptNo > 0 && (
         <div style={{ fontSize: '0.72rem', color: 'var(--color-ink-faint)' }}>
-          attempt {attemptNo}/{channels.length}
+          step {attemptNo}/{steps.length}
         </div>
       )}
     </div>

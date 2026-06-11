@@ -150,11 +150,15 @@ function extractHeuristic(text: string): {
   }
 
   let confidence = Math.min(0.9, 0.4 + found * 0.09);
-  // A CALL SUMMARY block is machine-transcribed structure — fewer fields than
-  // a full fax form, but each one reliable. Floor the overall score so clean
-  // call artifacts clear the default 0.8 gate while messy text never does.
+  // Structured machine-generated blocks are reliable even with few fields:
+  // CALL SUMMARY (transcription) and PORTAL SUBMISSION (a web form — the
+  // sender typed into labeled inputs). Floor their overall score so clean
+  // structured artifacts clear the default 0.8 gate while messy OCR never does.
   if (found >= 3 && /CALL SUMMARY/.test(text)) {
     confidence = Math.max(confidence, 0.86);
+  }
+  if (found >= 3 && /PORTAL SUBMISSION/.test(text)) {
+    confidence = Math.max(confidence, 0.92);
   }
   return { fields, confidence, extraction_meta: { fields: metaFields } };
 }
@@ -431,15 +435,36 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
 
   // -----------------------------------------------------------------------
   // Rule 7: Initial outbound for records_request_out (no agent_state.attempt_no)
+  // Reads both the new {steps:[{channel},...]} shape and legacy {channels:[...]} shape.
   // -----------------------------------------------------------------------
   if (
     workItem.type === 'records_request_out' &&
     !agentState['attempt_no'] &&
     !agentState['response_received']
   ) {
-    const chasePlan = agentState['chase_plan'] as { channels?: string[] } | undefined;
-    const preferredChannel = chasePlan?.channels?.[0];
-    const sendTool = pickSendTool(tools, preferredChannel);
+    const chasePlan = agentState['chase_plan'] as
+      | { steps?: Array<{ channel: string; attempt: number }>; channels?: string[] }
+      | undefined;
+    // Prefer new steps shape, fall back to legacy channels
+    const firstChannel =
+      chasePlan?.steps?.[0]?.channel ??
+      chasePlan?.channels?.[0];
+
+    // care_everywhere is handled by the Records Chaser via send_care_everywhere tool
+    // but since that tool is not in the registry, skip the normal send_tool picker.
+    // The ROI route already creates the initial attempt; agent should just wait
+    // for response and then mark_complete. So return 'wait' for care_everywhere.
+    if (firstChannel === 'care_everywhere') {
+      // No tool call needed — attempt already created by compose route
+      return {
+        action: 'wait',
+        params: {},
+        confidence: 0.99,
+        rationale: 'Care Everywhere attempt already sent — waiting for C-CDA return',
+      };
+    }
+
+    const sendTool = pickSendTool(tools, firstChannel);
     if (sendTool) {
       return {
         action: sendTool,

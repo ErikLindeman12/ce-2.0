@@ -365,8 +365,13 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
       const stateFlag = params['state_flag'] as string | undefined;
+      // Fulfillment sends (planner marks them records_sent) deliver the
+      // records — render the response document, not another request.
+      const kind: DocumentKind =
+        stateFlag === 'records_sent'
+          ? 'records_response'
+          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
@@ -393,8 +398,13 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
       const stateFlag = params['state_flag'] as string | undefined;
+      // Fulfillment sends (planner marks them records_sent) deliver the
+      // records — render the response document, not another request.
+      const kind: DocumentKind =
+        stateFlag === 'records_sent'
+          ? 'records_response'
+          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
@@ -421,8 +431,13 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
       const stateFlag = params['state_flag'] as string | undefined;
+      // Fulfillment sends (planner marks them records_sent) deliver the
+      // records — render the response document, not another request.
+      const kind: DocumentKind =
+        stateFlag === 'records_sent'
+          ? 'records_response'
+          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
@@ -449,8 +464,13 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
       const stateFlag = params['state_flag'] as string | undefined;
+      // Fulfillment sends (planner marks them records_sent) deliver the
+      // records — render the response document, not another request.
+      const kind: DocumentKind =
+        stateFlag === 'records_sent'
+          ? 'records_response'
+          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);

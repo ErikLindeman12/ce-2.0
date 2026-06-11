@@ -126,8 +126,28 @@ export type AgentMode = 'autonomous' | 'supervised' | 'shadow';
 export type WorkItemType = 'referral' | 'records_request_in' | 'records_request_out' | 'unknown';
 export type WorkItemStatus = 'open' | 'in_progress' | 'waiting' | 'done' | 'error';
 export type QueueKey = 'intake' | 'referrals' | 'roi_incoming' | 'roi_outgoing' | 'human_review';
-export type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal';
+export type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal' | 'care_everywhere';
 export type OutboundAttemptStatus = 'sent' | 'awaiting_response' | 'responded' | 'timed_out' | 'failed';
+
+// ---------------------------------------------------------------------------
+// Chase plan — new step-based model (w1b)
+// ---------------------------------------------------------------------------
+
+/** A single step in a chase ladder: a channel name + 1-based attempt counter. */
+export interface ChaseStep {
+  channel: OutboundChannel;
+  attempt: number;
+}
+
+/**
+ * New shape: {steps, waitSeconds}.
+ * Legacy shape {channels, waitSeconds} is still readable by consumers that
+ * check for it; buildChannelPlan returns the new shape only.
+ */
+export interface ChasePlan {
+  steps: ChaseStep[];
+  waitSeconds: number;
+}
 
 export interface WorkQueue {
   key: QueueKey;
@@ -177,6 +197,10 @@ export interface OrgContact {
     phone?: string;
     preferred_channel?: OutboundChannel | 'portal';
     simulation?: string;
+    chase_policy?: {
+      steps: string[];
+      waitSeconds?: number;
+    };
   };
 }
 
@@ -190,6 +214,7 @@ export interface Agent {
   confidence_threshold: number;
   model: string;
   mode: AgentMode;
+  config: Record<string, unknown>;
   created_at: string;
 }
 
@@ -363,6 +388,7 @@ export interface AgentResponse {
   confidenceThreshold: number;
   model: string;
   mode: AgentMode;
+  config: Record<string, unknown>;
   createdAt: string;
 }
 
@@ -423,6 +449,7 @@ export function toAgentResponse(a: Agent): AgentResponse {
     confidenceThreshold: a.confidence_threshold,
     model: a.model,
     mode: a.mode ?? 'autonomous',
+    config: a.config ?? {},
     createdAt: a.created_at,
   };
 }

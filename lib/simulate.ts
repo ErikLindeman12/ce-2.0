@@ -4,6 +4,13 @@
  * injectInbound(scenario)    — creates a work item in intake from a canned doc.
  * tick()                     — advances the world; idempotent and safe every ~5s.
  * handleAttemptResponse()    — exported so the portal API can call it too.
+ *
+ * W1b changes:
+ * - Chase loop reads the new ChasePlan {steps: ChaseStep[], waitSeconds} shape.
+ * - Legacy {channels:[...]} shape is still readable as fallback.
+ * - care_everywhere: respond_after = now+8s; never chased.
+ * - SECOND REQUEST framing: when a chase step has attempt > 1, priorAttemptAt is passed.
+ * - Escalation message includes the full step list (e.g. "fax, fax, voice").
  */
 
 import { getSupabase } from './supabase';
@@ -17,7 +24,7 @@ import {
   type Channel,
   type DocumentKind,
 } from './outbound';
-import type { TickReport, WorkItem } from './types';
+import type { ChaseStep, TickReport, WorkItem } from './types';
 
 // ---------------------------------------------------------------------------
 // Batch scenario definitions
@@ -102,7 +109,7 @@ export async function tick(): Promise<TickReport> {
 
   const { data: dueAttempts, error: dueErr } = await sb
     .from('outbound_attempts')
-    .select('*, work_item:work_items(id,org_id,queue_key,agent_state,extracted_data,matched_patient_id)')
+    .select('*, work_item:work_items(id,org_id,queue_key,agent_state,extracted_data,matched_patient_id,source_channel)')
     .in('status', ['sent', 'awaiting_response'])
     .lte('respond_after', now)
     // respond_after IS NOT NULL is implicit because lte(null) never matches
@@ -119,6 +126,7 @@ export async function tick(): Promise<TickReport> {
       channel: string;
       attempt_no: number;
       to_org_id: string | null;
+      payload?: Record<string, unknown> | null;
       work_item: {
         id: string;
         org_id: string | null;
@@ -126,17 +134,33 @@ export async function tick(): Promise<TickReport> {
         agent_state: Record<string, unknown>;
         extracted_data: Record<string, unknown>;
         matched_patient_id: string | null;
+        source_channel?: string;
       } | null;
     };
 
     // Skip portal attempts — they wait for a human response
     if (a.channel === 'portal') continue;
 
+    // A request-more-info aimed at a PORTAL-originated request: the requester
+    // IS the portal user — the simulated world must not answer on their
+    // behalf. The attempt stays pending until they attach the authorization
+    // in their portal ("Action needed").
+    if (
+      a.work_item?.source_channel === 'portal' &&
+      (a.payload?.['kind'] === 'request_more_info' ||
+        String(a.payload?.['subject'] ?? '').includes('Additional Information'))
+    ) {
+      continue;
+    }
+
+    // care_everywhere always responds (never no_response simulation)
+    const isCareEverywhere = a.channel === 'care_everywhere';
+
     const orgId = a.to_org_id ?? a.work_item?.org_id ?? null;
 
-    // Check simulation flag
+    // Check simulation flag (skipped for care_everywhere)
     let isNoResponse = false;
-    if (orgId) {
+    if (orgId && !isCareEverywhere) {
       const { data: org } = await sb
         .from('organizations')
         .select('contact')
@@ -201,7 +225,7 @@ export async function tick(): Promise<TickReport> {
 
       if (updated && updated.length > 0) {
         report.respondedAttempts.push(a.id);
-        console.log('[simulate.tick]', JSON.stringify({ event: 'responded', attemptId: a.id }));
+        console.log('[simulate.tick]', JSON.stringify({ event: 'responded', attemptId: a.id, channel: a.channel }));
 
         // Handle response effects per queue
         await handleAttemptResponse(
@@ -215,9 +239,9 @@ export async function tick(): Promise<TickReport> {
   }
 
   // -------------------------------------------------------------------------
-  // 2. Chase escalation for roi_outgoing items with timed-out attempts
-  //    Follows agent_state.chase_plan.channels when present;
-  //    falls back to legacy [fax, email, sms, voice] order.
+  // 2. Chase escalation for roi_outgoing items with timed-out attempts.
+  //    Reads the new ChasePlan {steps: ChaseStep[]} shape; falls back to legacy
+  //    {channels:[...]} or the hardcoded default order.
   // -------------------------------------------------------------------------
 
   const LEGACY_CHASE_ORDER: string[] = ['fax', 'email', 'sms', 'voice'];
@@ -225,15 +249,21 @@ export async function tick(): Promise<TickReport> {
   // Find roi_outgoing items that have a timed_out attempt and are now open
   const { data: chaseItems } = await sb
     .from('work_items')
-    .select('*, outbound_attempts(id,channel,attempt_no,status)')
+    .select('*, outbound_attempts(id,channel,attempt_no,status,created_at)')
     .eq('queue_key', 'roi_outgoing')
     .in('status', ['open', 'waiting'])
     .eq('assignee', 'unassigned');
 
   for (const rawItem of chaseItems ?? []) {
     const ci = rawItem as WorkItem & {
-      outbound_attempts: Array<{ id: string; channel: string; attempt_no: number; status: string }>;
+      outbound_attempts: Array<{ id: string; channel: string; attempt_no: number; status: string; created_at: string }>;
     };
+
+    // Never chase care_everywhere — it auto-responds
+    const hasCareEverywhereAttempt = (ci.outbound_attempts ?? []).some(
+      (a) => a.channel === 'care_everywhere',
+    );
+    if (hasCareEverywhereAttempt) continue;
 
     // Never chase while an attempt is still in flight
     const pending = (ci.outbound_attempts ?? []).some(
@@ -246,40 +276,70 @@ export async function tick(): Promise<TickReport> {
 
     // Find the highest attempt_no that timed out
     const latestTimedOut = timedOut.sort((a, b) => b.attempt_no - a.attempt_no)[0];
-    const lastChannel = latestTimedOut.channel;
-    const attemptNo = latestTimedOut.attempt_no;
+    const lastAttemptNo = latestTimedOut.attempt_no;
 
-    // Determine chase order: prefer agent_state.chase_plan.channels
+    // Read chase plan from agent_state
     const agentState = ci.agent_state as Record<string, unknown>;
-    const chasePlan = agentState['chase_plan'] as { channels?: string[]; waitSeconds?: number } | undefined;
-    const chaseOrder = (chasePlan?.channels ?? LEGACY_CHASE_ORDER).filter(
-      (ch) => ch !== 'portal', // portal never chased
+
+    // New shape: {steps: ChaseStep[], waitSeconds}
+    const chasePlanNew = agentState['chase_plan'] as
+      | { steps?: ChaseStep[]; channels?: string[]; waitSeconds?: number }
+      | undefined;
+
+    let chaseSteps: ChaseStep[];
+    const waitSeconds = chasePlanNew?.waitSeconds;
+
+    if (chasePlanNew?.steps && Array.isArray(chasePlanNew.steps) && chasePlanNew.steps.length > 0) {
+      // New step-based plan
+      chaseSteps = chasePlanNew.steps as ChaseStep[];
+    } else if (chasePlanNew?.channels && Array.isArray(chasePlanNew.channels)) {
+      // Legacy {channels:[...]} shape — expand into steps (no repeats)
+      const seen: Record<string, number> = {};
+      chaseSteps = (chasePlanNew.channels as string[])
+        .filter((ch) => ch !== 'portal' && ch !== 'care_everywhere')
+        .map((ch) => {
+          seen[ch] = (seen[ch] ?? 0) + 1;
+          return { channel: ch as Channel, attempt: seen[ch] };
+        });
+    } else {
+      // Default
+      chaseSteps = LEGACY_CHASE_ORDER.map((ch, i) => ({ channel: ch as Channel, attempt: i === 0 ? 1 : i }));
+    }
+
+    // Filter out care_everywhere and portal from chase steps
+    chaseSteps = chaseSteps.filter(
+      (s) => s.channel !== 'care_everywhere' && s.channel !== 'portal',
     );
-    const waitSeconds = chasePlan?.waitSeconds;
 
-    const nextChannelIdx = chaseOrder.indexOf(lastChannel) + 1;
+    if (chaseSteps.length === 0) continue;
 
-    if (nextChannelIdx >= chaseOrder.length || chaseOrder.length === 0) {
-      // All channels exhausted → escalate to human
+    // The next step is the one after lastAttemptNo (steps are 1-indexed by position)
+    const nextStepIdx = lastAttemptNo; // attempt_no=1 → next is index 1 (0-based)
+
+    if (nextStepIdx >= chaseSteps.length) {
+      // All steps exhausted → escalate to human
       const claimed = await claimForChase(ci.id);
       if (!claimed) continue;
 
-      const channelList = chaseOrder.join('/');
+      const stepList = chaseSteps.map((s) => s.channel).join(', ');
       await runTool(
         'escalate_to_human',
         ci.id,
         {
-          question: `No response after ${attemptNo} attempt${attemptNo !== 1 ? 's' : ''} across ${channelList || 'all channels'} — call them or close?`,
+          question: `No response after ${lastAttemptNo} attempt${lastAttemptNo !== 1 ? 's' : ''} (${stepList}) — call them or close?`,
         },
         'system',
       );
       report.escalations.push(ci.id);
       console.log(
         '[simulate.tick]',
-        JSON.stringify({ event: 'chase_escalated', itemId: ci.id }),
+        JSON.stringify({ event: 'chase_escalated', itemId: ci.id, steps: stepList }),
       );
     } else {
-      const nextChannel = chaseOrder[nextChannelIdx] as Channel;
+      const nextStep = chaseSteps[nextStepIdx];
+      const nextChannel = nextStep.channel;
+      const chaseAttemptNo = lastAttemptNo + 1;
+
       const claimed = await claimForChase(ci.id);
       if (!claimed) continue;
 
@@ -292,9 +352,8 @@ export async function tick(): Promise<TickReport> {
       };
 
       // Build rendered document for the chase attempt
-      const chaseAttemptNo = attemptNo + 1;
       const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
-      const outboundCtx = await buildChaseContext(ci, orgId, chaseAttemptNo, contact);
+      const outboundCtx = await buildChaseContext(ci, orgId, chaseAttemptNo, contact, latestTimedOut.created_at);
       const rendered = renderOutboundDocument(nextChannel, kind, outboundCtx);
       const payload = {
         subject: rendered.subject,
@@ -330,6 +389,7 @@ export async function tick(): Promise<TickReport> {
           detail: {
             attempt_no: chaseAttemptNo,
             channel: nextChannel,
+            channel_attempt: nextStep.attempt,
             attempt_id: (newAttempt as { id: string }).id,
           },
         });
@@ -352,7 +412,13 @@ export async function tick(): Promise<TickReport> {
       report.chaseAttempts.push(ci.id);
       console.log(
         '[simulate.tick]',
-        JSON.stringify({ event: 'chase_next', itemId: ci.id, channel: nextChannel, attemptNo: chaseAttemptNo }),
+        JSON.stringify({
+          event: 'chase_next',
+          itemId: ci.id,
+          channel: nextChannel,
+          channelAttempt: nextStep.attempt,
+          attemptNo: chaseAttemptNo,
+        }),
       );
     }
   }
@@ -420,15 +486,26 @@ export async function handleAttemptResponse(
       })
       .eq('id', workItemId);
   } else if (queueKey === 'roi_incoming') {
-    // Authorization or info arrived — merge into extracted_data, set back to open
+    // Authorization or info arrived — merge into extracted_data, set back to open.
+    // Also clear the cached verify_requirements result: it was computed BEFORE
+    // this new info and would otherwise deadlock the planner (verify "done"
+    // but recorded incomplete → fulfillment never fires).
     const mergedExtracted = { ...existingExtracted };
     if (response['authorization']) {
       mergedExtracted['authorization'] = response['authorization'];
     }
+    const { data: stItem } = await sb
+      .from('work_items')
+      .select('agent_state')
+      .eq('id', workItemId)
+      .single();
+    const st = ((stItem as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {}) as Record<string, unknown>;
+    delete st['requirements'];
     await sb
       .from('work_items')
       .update({
         extracted_data: mergedExtracted,
+        agent_state: st,
         status: 'open',
         assignee: 'unassigned',
         updated_at: new Date().toISOString(),
@@ -485,7 +562,7 @@ async function buildSimulatedResponse(
   matchedPatientId: string | null,
 ): Promise<Record<string, unknown>> {
   if (queueKey === 'roi_outgoing') {
-    // Build a RECORDS TRANSMITTAL document
+    // Build a RECORDS TRANSMITTAL document (C-CDA for care_everywhere)
     const sb = getSupabase();
     let patientName = 'Patient';
     let patientDob: string | undefined;
@@ -523,8 +600,10 @@ async function buildSimulatedResponse(
     });
 
     return {
-      status: 'records_provided',
-      message: 'Records are attached. All requested documents are included.',
+      status: channel === 'care_everywhere' ? 'records_provided_ccd' : 'records_provided',
+      message: channel === 'care_everywhere'
+        ? 'C-CDA document returned via Care Everywhere.'
+        : 'Records are attached. All requested documents are included.',
       document: transmittal,
       ref: refNo,
       received_at: new Date().toISOString(),
@@ -553,6 +632,7 @@ async function buildChaseContext(
   orgId: string | null,
   attemptNo: number,
   contact: { fax?: string; email?: string; phone?: string } | null,
+  priorAttemptAt?: string,
 ): Promise<import('./outbound').OutboundContext> {
   const sb = getSupabase();
   const extracted = item.extracted_data as Record<string, string>;
@@ -602,5 +682,6 @@ async function buildChaseContext(
     orgEmail: contact?.email,
     orgPhone: contact?.phone,
     attemptNo,
+    priorAttemptAt,
   };
 }

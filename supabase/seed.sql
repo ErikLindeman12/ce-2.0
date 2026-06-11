@@ -183,3 +183,61 @@ UPDATE organizations
 UPDATE organizations
   SET contact = (contact - 'email') || '{"preferred_channel":"fax"}'::jsonb
   WHERE id = 'org_mgh';
+
+-- =============================================================================
+-- W1b seed additions (idempotent)
+-- =============================================================================
+
+-- Records Chaser: set config.chase_policy (fax → fax → voice @ 30s wait).
+-- Steps stored as plain channel strings; expanded to ChaseStep at compose time.
+INSERT INTO agents (name, queue_key, enabled, instructions, tools, confidence_threshold, model, config)
+  VALUES (
+    'Records Chaser',
+    'roi_outgoing',
+    true,
+    'Send outgoing records requests and manage the chase loop. On a fresh item compose and send the initial request via the org preferred channel. When a response arrives mark the item complete with "records received".',
+    '{send_fax,send_email,send_sms,place_call,mark_complete,escalate_to_human}',
+    0.7,
+    'heuristic',
+    '{"chase_policy":{"steps":["fax","fax","voice"],"waitSeconds":30}}'
+  )
+  ON CONFLICT (name) DO UPDATE
+    SET config = '{"chase_policy":{"steps":["fax","fax","voice"],"waitSeconds":30}}'::jsonb;
+
+-- org_mgh: secure-email ladder (email → voice @ 30s wait).
+UPDATE organizations
+  SET contact = contact || '{"chase_policy":{"steps":["email","voice"],"waitSeconds":30}}'::jsonb
+  WHERE id = 'org_mgh';
+
+-- org_cleveland: remove preferred_channel='portal' (portal is no longer an outbound channel).
+-- Ensure 'cloud' is in capabilities.channels for Care Everywhere detection.
+UPDATE organizations
+  SET contact = contact - 'preferred_channel'
+  WHERE id = 'org_cleveland'
+    AND contact->>'preferred_channel' = 'portal';
+
+UPDATE organizations
+  SET channels = array(
+    SELECT DISTINCT unnest(channels || ARRAY['cloud'])
+  )
+  WHERE id = 'org_cleveland'
+    AND NOT ('cloud' = ANY(channels));
+
+-- org_mayo: ensure 'cloud' in capabilities.channels (Care Everywhere).
+UPDATE organizations
+  SET channels = array(
+    SELECT DISTINCT unnest(channels || ARRAY['cloud'])
+  )
+  WHERE id = 'org_mayo'
+    AND NOT ('cloud' = ANY(channels));
+
+-- W1b: network membership — only true Epic orgs carry 'cloud' (Care Everywhere).
+-- Off-network orgs are reached via chase ladders (fax/secure email/voice).
+UPDATE organizations SET channels = array_remove(channels, 'cloud')
+  WHERE id IN ('org_ucsf','org_mgh','org_aurora','org_kaiser','org_froedtert');
+
+-- W1b: org_mgh is the secure-email-ladder org — it needs an email address
+-- (its email was removed in an earlier demo role; chase steps without contact
+-- info are skipped, which silently collapsed its email→voice ladder).
+UPDATE organizations SET contact = contact || '{"email":"records@mgh.example"}'::jsonb
+  WHERE id = 'org_mgh';
