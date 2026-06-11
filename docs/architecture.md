@@ -6,6 +6,9 @@ instead of restating it. If something here is wrong, fix it *here* — don't wor
 around it in an issue.
 
 Operational how-to (run/test/deploy) lives in [repo-guide.md](repo-guide.md).
+The forward-looking design model — channels, fax, events/subscriptions, and
+patient-mediated referral, with what's PoC vs. deferred — lives in
+[platform-model.md](platform-model.md).
 
 ## Vision
 
@@ -27,7 +30,9 @@ metered per call.** That single flow tells the whole story.
   *Built (CE-6): `providers` table, server-side specialty/capability search.*
 - **Location** — a physical site for an org/provider. *Planned.*
 - **Referral** — a request to send a patient + data to a target org/provider;
-  has a status lifecycle and an event log. *Basic version built.*
+  has a status lifecycle and an event log. *Basic version built.* Target-bound at
+  creation today; a future **open-referral** mode lets the target be chosen later
+  by the patient — see [platform-model.md §6](platform-model.md).
 - **API key / token** — caller identity; exchanged for short-lived scoped
   tokens; supports on-behalf-of (OBO) delegation. *Planned.*
 - **Usage event** — one metered unit of API consumption (the billing primitive).
