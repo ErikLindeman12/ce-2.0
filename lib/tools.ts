@@ -491,8 +491,10 @@ export const TOOLS: Record<string, ToolDef> = {
   resolve_review: {
     description: 'Resolve a Human Review escalation: apply correction and route onward.',
     async execute(workItemId, params, _actor) {
-      const chosenPatientId = params['patient_id'] as string | undefined;
-      const nextQueue = params['queue_key'] as string | undefined;
+      const chosenPatientId = (params['patient_id'] ?? params['patientId']) as
+        | string
+        | undefined;
+      const nextQueue = (params['queue_key'] ?? params['queueKey']) as string | undefined;
 
       const sb = getSupabase();
       const updates: Record<string, unknown> = {

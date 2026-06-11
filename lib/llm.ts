@@ -113,7 +113,7 @@ function extractHeuristic(text: string): {
     return { fields, confidence: 0.15 };
   }
 
-  const confidence = Math.min(0.9, 0.4 + found * 0.07);
+  const confidence = Math.min(0.9, 0.4 + found * 0.09);
   return { fields, confidence };
 }
 
@@ -198,12 +198,12 @@ async function matchPatientHeuristic(
   const dobList = patients
     .map((p) => `DOB ${p.dob}`)
     .join(' vs ');
-  const fullName = `${firstName} ${lastName}`.trim();
+  const displayName = `${patients[0].first_name} ${patients[0].last_name}`.trim();
   return {
     patientId: null,
     candidates: patients,
     confidence: 0.45,
-    question: `Two patients named ${fullName} (${dobList}). Which one?`,
+    question: `${patients.length} patients named ${displayName} (${dobList}). Which one?`,
   };
 }
 
@@ -300,13 +300,16 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
         !!(extracted['authorization'] as string | undefined) &&
         !/to follow/i.test((extracted['authorization'] as string) ?? '');
       const completeness = [hasPatient, hasRecords, hasAuth].filter(Boolean).length / 3;
-      const confidence = 0.4 + completeness * 0.55;
+      // Determining WHICH requirements are missing is a high-confidence finding;
+      // what to do about a gap is decided in the next step (request_more_info).
+      // Only an unmatched patient is a genuine uncertainty worth escalating here.
+      const confidence = hasPatient ? 0.95 : 0.5;
       return {
         action: 'verify_requirements',
         params: { has_patient: hasPatient, has_records: hasRecords, has_auth: hasAuth },
         confidence,
         rationale: `Requirements: patient=${hasPatient}, records=${hasRecords}, auth=${hasAuth} — completeness ${(completeness * 100).toFixed(0)}%`,
-        question: !hasAuth ? 'Authorization line missing. Request it from the requester?' : undefined,
+        question: !hasPatient ? 'No matched patient on this records request — verify identity before releasing records.' : undefined,
       };
     }
 
@@ -366,8 +369,22 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
 
   // --- ROI OUTGOING pipeline ---
   if (agent.queue_key === 'roi_outgoing') {
-    // Initial send on a fresh item
+    const agentState = workItem.agent_state as Record<string, unknown>;
+
+    // Response arrived (tick reopened the item) — close it out
+    if (agentState['response_received'] && !alreadyDone.has('mark_complete')) {
+      return {
+        action: 'mark_complete',
+        params: { note: 'Records received.' },
+        confidence: 0.98,
+        rationale: 'Response received — marking complete',
+      };
+    }
+
+    // Initial send on a fresh item — agent_state.attempt_no is the durable
+    // guard (stepHistory only covers this run; retries are owned by tick()).
     if (
+      !agentState['attempt_no'] &&
       !alreadyDone.has('send_fax') &&
       !alreadyDone.has('send_email') &&
       !alreadyDone.has('send_sms') &&
@@ -383,27 +400,16 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
         rationale: 'Fresh outgoing ROI — sending initial request via preferred channel',
       };
     }
-
-    // Mark complete when response arrived (tick handles this transition)
-    if (
-      (workItem.agent_state as Record<string, unknown>)['response_received'] &&
-      !alreadyDone.has('mark_complete')
-    ) {
-      return {
-        action: 'mark_complete',
-        params: { note: 'Records received.' },
-        confidence: 0.98,
-        rationale: 'Response received — marking complete',
-      };
-    }
   }
 
-  // Fallback — nothing to do
+  // Fallback — nothing actionable right now (e.g. awaiting an outbound
+  // response). A no-op, NOT an escalation: escalating here would flood
+  // Human Review every tick for items that are simply waiting.
   return {
-    action: 'escalate_to_human',
-    params: { question: 'Agent pipeline exhausted without resolution. Please review.' },
-    confidence: 0.5,
-    rationale: 'No applicable heuristic step found',
+    action: 'wait',
+    params: {},
+    confidence: 0.99,
+    rationale: 'No applicable step right now — waiting',
   };
 }
 

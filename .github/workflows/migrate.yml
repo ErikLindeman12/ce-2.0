@@ -28,9 +28,14 @@ jobs:
         with:
           version: latest
 
+      # Supabase CLI v2.10x removed --project-ref from db commands; they
+      # operate on the linked project instead.
+      - name: Link project
+        run: supabase link --project-ref $PROJECT_REF
+
       - name: Push migrations
-        run: supabase db push --project-ref $PROJECT_REF
+        run: supabase db push --linked
 
       - name: Run seed
         if: github.event_name == 'workflow_dispatch' && inputs.run_seed == true
-        run: supabase db query --project-ref $PROJECT_REF -f supabase/seed.sql
+        run: supabase db query --linked -f supabase/seed.sql

@@ -170,6 +170,14 @@ export async function tick(): Promise<TickReport> {
       outbound_attempts: Array<{ id: string; channel: string; attempt_no: number; status: string }>;
     };
 
+    // Never chase while an attempt is still in flight — otherwise every tick
+    // re-fires the next channel off the highest *timed-out* attempt and each
+    // escalation step goes out twice.
+    const pending = (ci.outbound_attempts ?? []).some(
+      (a) => a.status === 'sent' || a.status === 'awaiting_response',
+    );
+    if (pending) continue;
+
     const timedOut = (ci.outbound_attempts ?? []).filter((a) => a.status === 'timed_out');
     if (timedOut.length === 0) continue;
 
@@ -352,6 +360,18 @@ async function handleAttemptResponse(
   existingExtracted: Record<string, unknown>,
 ): Promise<void> {
   const sb = getSupabase();
+
+  // A response on an already-completed item (e.g. delivery confirmation of a
+  // records-response fax) must not reopen it — that would re-run the pipeline
+  // and re-send records every tick.
+  const { data: current } = await sb
+    .from('work_items')
+    .select('status')
+    .eq('id', workItemId)
+    .single();
+  if ((current as { status: string } | null)?.status === 'done') {
+    return;
+  }
 
   if (queueKey === 'roi_outgoing') {
     // Records received — mark agent_state so the Records Chaser can complete it

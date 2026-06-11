@@ -56,7 +56,7 @@ async function releaseItem(itemId: string): Promise<void> {
   // If still in_progress after our run, set back to open so next tick picks it up
   await getSupabase()
     .from('work_items')
-    .update({ assignee: 'unassigned', updated_at: new Date().toISOString() })
+    .update({ assignee: 'unassigned', status: 'open', updated_at: new Date().toISOString() })
     .eq('id', itemId)
     .eq('status', 'in_progress');
 }
@@ -113,7 +113,10 @@ async function stepItem(
     if (!fresh) break;
     currentItem = fresh as unknown as WorkItem;
 
-    // If item has been moved out of our queue or is done/human, stop
+    // Stop if the item moved out of our queue, finished, or went to a human.
+    // (A 'waiting' status alone does NOT stop the run — e.g. roi_incoming
+    // sends records then must still mark_complete; pipelines with nothing
+    // left to do return the 'wait' no-op decision instead.)
     if (
       currentItem.queue_key !== agent.queue_key ||
       currentItem.status === 'done' ||
@@ -127,6 +130,11 @@ async function stepItem(
       agent,
       stepHistory,
     });
+
+    // Explicit no-op: nothing actionable on this item right now.
+    if (decision.action === 'wait') {
+      break;
+    }
 
     console.log(
       '[agent.run]',

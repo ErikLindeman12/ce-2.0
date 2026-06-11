@@ -104,10 +104,29 @@ export async function getWorkItem(id: string): Promise<WorkItemDetail | null> {
 
   return {
     item: wi,
-    auditTrail: (auditRes.data ?? []) as unknown as AuditLogEntry[],
+    auditTrail: await withAgentNames(
+      (auditRes.data ?? []) as unknown as AuditLogEntry[],
+    ),
     outboundAttempts: (attemptsRes.data ?? []) as unknown as OutboundAttempt[],
     patientCandidates,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Replace raw `agent:<uuid>` actors with `agent:<Name>` for display
+// ---------------------------------------------------------------------------
+
+async function withAgentNames(entries: AuditLogEntry[]): Promise<AuditLogEntry[]> {
+  if (!entries.some((e) => e.actor.startsWith('agent:'))) return entries;
+  const { data } = await getSupabase().from('agents').select('id,name');
+  const names = new Map(
+    ((data ?? []) as Array<{ id: string; name: string }>).map((a) => [a.id, a.name]),
+  );
+  return entries.map((e) => {
+    if (!e.actor.startsWith('agent:')) return e;
+    const name = names.get(e.actor.slice('agent:'.length));
+    return name ? { ...e, actor: `agent:${name}` } : e;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -346,5 +365,5 @@ export async function recentActivity(limit: number = 30): Promise<AuditLogEntry[
     .limit(limit);
 
   if (error) throw new Error(`activity query failed: ${error.message}`);
-  return (data ?? []) as unknown as AuditLogEntry[];
+  return withAgentNames((data ?? []) as unknown as AuditLogEntry[]);
 }

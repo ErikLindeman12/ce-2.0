@@ -4,6 +4,18 @@
 > **Time needed:** ~10 minutes for the four flows
 > **Prerequisites:** branch merged to main, `supabase db push` applied, seed loaded.
 
+> ⚠️ **Before any demo:** the Supabase free-tier project pauses after ~1 week
+> idle, and a paused DB breaks *everything* (including prod) with confusing
+> timeouts. Check https://supabase.com/dashboard/project/mmvjptmuazcamuduhyzz —
+> if INACTIVE, restore and wait ~2 minutes.
+
+**Easiest way to drive the demo:** open `/queues`, flip **auto-tick ON**, and
+use the simulate-panel buttons. The tick is the simulated world clock — it
+delivers outbound responses/timeouts, advances the chase loop, and runs every
+enabled agent each ~5s, so queues visibly move on their own while you narrate.
+The curl blocks below are the headless equivalent (use "Tick now" / manual
+ticks instead when you want to step the world frame by frame).
+
 ---
 
 ## Setup (run once before the demo)

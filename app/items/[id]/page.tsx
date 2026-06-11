@@ -134,9 +134,16 @@ export default function WorkItemDetailPage() {
         setError(body.error ?? 'Failed to load');
         return;
       }
-      const body = (await res.json()) as WorkItemDetail | { data: WorkItemDetail };
-      // Handle both wrapped and unwrapped shapes
-      const data = 'data' in body ? (body as { data: WorkItemDetail }).data : body as WorkItemDetail;
+      const body = (await res.json()) as Record<string, unknown>;
+      // Handle both wrapped and unwrapped shapes, and the API's actual key
+      // names (auditTrail/outboundAttempts) alongside the spec's (audit/attempts).
+      const raw = (body['data'] ?? body) as Record<string, unknown>;
+      const data: WorkItemDetail = {
+        item: raw['item'] as WorkItemDetail['item'],
+        audit: (raw['audit'] ?? raw['auditTrail'] ?? []) as WorkItemDetail['audit'],
+        attempts: (raw['attempts'] ?? raw['outboundAttempts'] ?? []) as WorkItemDetail['attempts'],
+        patientCandidates: (raw['patientCandidates'] ?? []) as WorkItemDetail['patientCandidates'],
+      };
       setDetail(data);
       setError(null);
     } catch (e) {

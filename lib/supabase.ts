@@ -14,6 +14,14 @@ export function getSupabase(): SupabaseClient {
     throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY');
   }
 
-  client = createClient(url, key, { auth: { persistSession: false } });
+  client = createClient(url, key, {
+    auth: { persistSession: false },
+    global: {
+      // Next.js patches global fetch with its Data Cache, which silently
+      // caches Supabase REST reads inside route handlers — queue views and
+      // item details would serve minutes-old snapshots. Always bypass it.
+      fetch: (input, init) => fetch(input, { ...init, cache: 'no-store' }),
+    },
+  });
   return client;
 }
