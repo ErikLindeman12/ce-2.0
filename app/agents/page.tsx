@@ -6,6 +6,18 @@ import { useEffect, useState, useCallback } from 'react';
 // Types
 // ---------------------------------------------------------------------------
 
+type AgentMode = 'autonomous' | 'supervised' | 'shadow';
+
+interface AgentStats {
+  processed: number;
+  actions: number;
+  escalations: number;
+  proposals: number;
+  shadowDecisions: number;
+  avgConfidence: number;
+  autoRate: number;
+}
+
 interface Agent {
   id: string;
   name: string;
@@ -17,6 +29,7 @@ interface Agent {
   confidenceThreshold?: number;
   confidence_threshold?: number;
   model: string;
+  mode?: AgentMode;
   createdAt?: string;
   created_at?: string;
 }
@@ -42,6 +55,7 @@ function normalizeAgent(a: Record<string, unknown>): Agent {
     confidenceThreshold: (a.confidenceThreshold ?? a.confidence_threshold) as number,
     confidence_threshold: (a.confidence_threshold ?? a.confidenceThreshold) as number,
     model: (a.model as string) ?? 'heuristic',
+    mode: ((a.mode as AgentMode | undefined) ?? 'autonomous'),
     createdAt: (a.createdAt ?? a.created_at) as string | undefined,
     created_at: (a.created_at ?? a.createdAt) as string | undefined,
   };
@@ -93,6 +107,7 @@ interface AgentForm {
   confidenceThreshold: number;
   model: string;
   enabled: boolean;
+  mode: AgentMode;
 }
 
 function blankForm(): AgentForm {
@@ -104,6 +119,7 @@ function blankForm(): AgentForm {
     confidenceThreshold: 0.8,
     model: 'heuristic',
     enabled: true,
+    mode: 'autonomous',
   };
 }
 
@@ -116,8 +132,37 @@ function agentToForm(a: Agent): AgentForm {
     confidenceThreshold: agentThreshold(a),
     model: a.model,
     enabled: a.enabled,
+    mode: a.mode ?? 'autonomous',
   };
 }
+
+// ---------------------------------------------------------------------------
+// Mode selector config
+// ---------------------------------------------------------------------------
+
+const MODE_CONFIG: Record<AgentMode, { label: string; desc: string; color: string; bg: string; border: string }> = {
+  shadow: {
+    label: 'Shadow',
+    desc: 'Logs decisions, never acts',
+    color: '#6b7280',
+    bg: '#f3f4f6',
+    border: '#d1d5db',
+  },
+  supervised: {
+    label: 'Supervised',
+    desc: 'Proposes — humans approve',
+    color: '#92400e',
+    bg: '#fef3c7',
+    border: '#fcd34d',
+  },
+  autonomous: {
+    label: 'Autonomous',
+    desc: 'Acts above the threshold',
+    color: '#065f46',
+    bg: '#d1fae5',
+    border: '#6ee7b7',
+  },
+};
 
 // ---------------------------------------------------------------------------
 // Component
@@ -140,6 +185,12 @@ export default function AgentsPage() {
 
   // Toggle in-flight tracking
   const [toggling, setToggling] = useState<Set<string>>(new Set());
+
+  // Mode patch in-flight tracking
+  const [patchingMode, setPatchingMode] = useState<Set<string>>(new Set());
+
+  // Per-agent stats (keyed by agent id; null = loading/error)
+  const [agentStats, setAgentStats] = useState<Record<string, AgentStats | null>>({});
 
   // ---------------------------------------------------------------------------
   // Load
@@ -179,6 +230,44 @@ export default function AgentsPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Fetch per-agent stats whenever agent list changes
+  useEffect(() => {
+    if (agents.length === 0) return;
+    agents.forEach((agent) => {
+      fetch(`/api/agents/${agent.id}/stats`, { cache: 'no-store' })
+        .then(async (res) => {
+          if (!res.ok) return; // 404 while backend is building — skip gracefully
+          const body = (await res.json()) as { data?: AgentStats } | AgentStats;
+          const stats = ('data' in body && body.data) ? body.data : (body as AgentStats);
+          setAgentStats((prev) => ({ ...prev, [agent.id]: stats }));
+        })
+        .catch(() => { /* endpoint not ready yet — hide gracefully */ });
+    });
+  }, [agents]);
+
+  // ---------------------------------------------------------------------------
+  // Patch mode inline
+  // ---------------------------------------------------------------------------
+
+  async function patchMode(agent: Agent, mode: AgentMode) {
+    const id = agent.id;
+    setPatchingMode((prev) => new Set(prev).add(id));
+    try {
+      await fetch(`/api/agents/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      void load();
+    } finally {
+      setPatchingMode((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+    }
+  }
 
   // ---------------------------------------------------------------------------
   // Toggle enabled
@@ -243,6 +332,7 @@ export default function AgentsPage() {
       confidence_threshold: form.confidenceThreshold,
       model: form.model,
       enabled: form.enabled,
+      mode: form.mode,
     };
 
     try {
@@ -348,6 +438,10 @@ export default function AgentsPage() {
         {agents.map((agent) => {
           const threshold = agentThreshold(agent);
           const queueKey = agentQueueKey(agent);
+          const currentMode: AgentMode = agent.mode ?? 'autonomous';
+          const modePatching = patchingMode.has(agent.id);
+          const stats = agentStats[agent.id] ?? null;
+
           return (
             <div key={agent.id} style={{
               background: '#fff',
@@ -358,6 +452,7 @@ export default function AgentsPage() {
             }}>
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px' }}>
                 <div style={{ flex: 1 }}>
+                  {/* Name row */}
                   <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
                     <span style={{ fontWeight: 700, fontSize: '1rem' }}>{agent.name}</span>
                     <span style={{
@@ -392,9 +487,67 @@ export default function AgentsPage() {
                     </span>
                   </div>
 
+                  {/* Mode selector */}
+                  <div style={{ marginBottom: '10px' }}>
+                    <div className="agent-mode-selector" style={{ opacity: modePatching ? 0.6 : 1, pointerEvents: modePatching ? 'none' : 'auto' }}>
+                      {(Object.keys(MODE_CONFIG) as AgentMode[]).map((m) => {
+                        const cfg = MODE_CONFIG[m];
+                        const active = currentMode === m;
+                        return (
+                          <button
+                            key={m}
+                            onClick={() => void patchMode(agent, m)}
+                            className={`agent-mode-btn${active ? ' active' : ''}`}
+                            style={active ? {
+                              background: cfg.bg,
+                              color: cfg.color,
+                              borderColor: cfg.border,
+                            } : {}}
+                            title={cfg.desc}
+                          >
+                            <span className="agent-mode-label">{cfg.label}</span>
+                            <span className="agent-mode-desc">{cfg.desc}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {/* Mini stats strip */}
+                  {stats !== null ? (
+                    <div className="agent-mini-stats">
+                      <span className="agent-mini-stat">
+                        <span className="agent-mini-stat-label">Processed</span>
+                        <span className="agent-mini-stat-value">{stats.processed}</span>
+                      </span>
+                      <span className="agent-mini-stat-divider" />
+                      <span className="agent-mini-stat">
+                        <span className="agent-mini-stat-label">Auto-rate</span>
+                        <span className="agent-mini-stat-value">{(stats.autoRate * 100).toFixed(0)}%</span>
+                      </span>
+                      <span className="agent-mini-stat-divider" />
+                      <span className="agent-mini-stat">
+                        <span className="agent-mini-stat-label">Escalations</span>
+                        <span className="agent-mini-stat-value">{stats.escalations}</span>
+                      </span>
+                      <span className="agent-mini-stat-divider" />
+                      <span className="agent-mini-stat">
+                        <span className="agent-mini-stat-label">Proposals</span>
+                        <span className="agent-mini-stat-value">{stats.proposals}</span>
+                      </span>
+                    </div>
+                  ) : (
+                    /* Skeleton shown while loading; hides if 404 */
+                    <div className="agent-mini-stats agent-mini-stats-skeleton" aria-hidden="true">
+                      {[80, 52, 72, 60].map((w, i) => (
+                        <span key={i} className="agent-mini-stat-skel" style={{ width: w }} />
+                      ))}
+                    </div>
+                  )}
+
                   {/* Tool chips */}
                   {agent.tools.length > 0 && (
-                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '8px' }}>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px', marginBottom: '8px', marginTop: '10px' }}>
                       {agent.tools.map((t) => (
                         <span key={t} style={{
                           padding: '2px 8px',
@@ -590,6 +743,33 @@ export default function AgentsPage() {
                   <option key={m.value} value={m.value}>{m.label}</option>
                 ))}
               </select>
+            </div>
+
+            {/* Mode */}
+            <div style={fieldGroup}>
+              <label style={labelStyle}>Mode</label>
+              <div className="agent-mode-selector">
+                {(Object.keys(MODE_CONFIG) as AgentMode[]).map((m) => {
+                  const cfg = MODE_CONFIG[m];
+                  const active = form.mode === m;
+                  return (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => setForm((f) => ({ ...f, mode: m }))}
+                      className={`agent-mode-btn${active ? ' active' : ''}`}
+                      style={active ? {
+                        background: cfg.bg,
+                        color: cfg.color,
+                        borderColor: cfg.border,
+                      } : {}}
+                    >
+                      <span className="agent-mode-label">{cfg.label}</span>
+                      <span className="agent-mode-desc">{cfg.desc}</span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
 
             {/* Enabled */}

@@ -31,7 +31,7 @@ export async function PATCH(
   }
 
   // Whitelist updatable fields
-  const allowed = ['name', 'enabled', 'instructions', 'tools', 'confidence_threshold', 'model'];
+  const allowed = ['name', 'enabled', 'instructions', 'tools', 'confidence_threshold', 'model', 'mode'];
   const updates: Record<string, unknown> = {};
   for (const key of allowed) {
     if (key in body) updates[key] = body[key];

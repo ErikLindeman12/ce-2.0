@@ -21,6 +21,7 @@ export async function POST(req: NextRequest) {
     tools?: string[];
     confidence_threshold?: number;
     model?: string;
+    mode?: string;
   };
 
   try {

@@ -117,7 +117,11 @@ export type ToolName =
   | 'request_more_info'
   | 'mark_complete'
   | 'escalate_to_human'
-  | 'resolve_review';
+  | 'resolve_review'
+  | 'approve_action'
+  | 'reject_action';
+
+export type AgentMode = 'autonomous' | 'supervised' | 'shadow';
 
 export type WorkItemType = 'referral' | 'records_request_in' | 'records_request_out' | 'unknown';
 export type WorkItemStatus = 'open' | 'in_progress' | 'waiting' | 'done' | 'error';
@@ -185,7 +189,20 @@ export interface Agent {
   tools: string[];
   confidence_threshold: number;
   model: string;
+  mode: AgentMode;
   created_at: string;
+}
+
+/** Shape returned by GET /api/agents/[id]/stats and each entry in GET /api/agents/stats */
+export interface AgentStats {
+  agentId: string;
+  processed: number;
+  actions: number;
+  escalations: number;
+  proposals: number;
+  shadowDecisions: number;
+  avgConfidence: number;
+  autoRate: number;
 }
 
 export interface OutboundAttempt {
@@ -345,6 +362,7 @@ export interface AgentResponse {
   tools: string[];
   confidenceThreshold: number;
   model: string;
+  mode: AgentMode;
   createdAt: string;
 }
 
@@ -404,6 +422,7 @@ export function toAgentResponse(a: Agent): AgentResponse {
     tools: a.tools,
     confidenceThreshold: a.confidence_threshold,
     model: a.model,
+    mode: a.mode ?? 'autonomous',
     createdAt: a.created_at,
   };
 }

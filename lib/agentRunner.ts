@@ -151,7 +151,7 @@ async function stepItem(
 
     // Confidence gate
     if (decision.confidence < agent.confidence_threshold) {
-      // Escalate to human with the specific question
+      // Escalate to human with the specific question (all modes)
       const question =
         decision.question ??
         `Confidence ${decision.confidence.toFixed(2)} below threshold ${agent.confidence_threshold} on step "${decision.action}". ${decision.rationale}`;
@@ -180,6 +180,115 @@ async function stepItem(
       );
       break;
     }
+
+    const agentMode = agent.mode ?? 'autonomous';
+
+    // ----- SHADOW mode: audit the decision, mark it seen, leave item alone -----
+    if (agentMode === 'shadow') {
+      // Build a step key to avoid re-logging the same decision every tick
+      const stepKey = `${decision.action}:${JSON.stringify(decision.params)}`;
+      const shadowSeen = ((currentItem.agent_state as Record<string, unknown>)['shadow_seen'] ?? {}) as Record<string, boolean>;
+
+      if (!shadowSeen[stepKey]) {
+        const sb = getSupabase();
+        await sb.from('audit_log').insert({
+          work_item_id: currentItem.id,
+          actor,
+          action: 'shadow_decision',
+          detail: {
+            action: decision.action,
+            params: decision.params,
+            confidence: decision.confidence,
+            rationale: decision.rationale,
+          },
+        });
+        const { data: freshData } = await sb
+          .from('work_items')
+          .select('agent_state')
+          .eq('id', currentItem.id)
+          .single();
+        const freshState = (freshData as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
+        const updatedSeen = { ...(freshState['shadow_seen'] as Record<string, boolean> ?? {}), [stepKey]: true };
+        await sb
+          .from('work_items')
+          .update({ agent_state: { ...freshState, shadow_seen: updatedSeen }, updated_at: new Date().toISOString() })
+          .eq('id', currentItem.id);
+
+        actions.push({ itemId: currentItem.id, action: 'shadow_decision', confidence: decision.confidence, actor });
+      }
+
+      // Release item (back to open/unassigned) so other agents/humans can act on it
+      await getSupabase()
+        .from('work_items')
+        .update({ assignee: 'unassigned', status: 'open', updated_at: new Date().toISOString() })
+        .eq('id', currentItem.id)
+        .eq('status', 'in_progress');
+      break;
+    }
+
+    // Supervision gates actions with EXTERNAL effects (sends, calls, routing).
+    // Annotation steps that only enrich the item (classify/extract/match/
+    // verify/complete) execute even under supervision — otherwise one item
+    // needs three approvals and the mode is unusable.
+    const SUPERVISED_PASSTHROUGH = new Set([
+      'classify_document',
+      'extract_fields',
+      'match_patient',
+      'verify_requirements',
+      'mark_complete',
+    ]);
+
+    // ----- SUPERVISED mode: propose the action, wait for human approval -----
+    if (agentMode === 'supervised' && !SUPERVISED_PASSTHROUGH.has(decision.action)) {
+      const pendingApproval = {
+        action: decision.action,
+        params: decision.params,
+        confidence: decision.confidence,
+        rationale: decision.rationale,
+        agentId: agent.id,
+        agentName: agent.name,
+      };
+
+      const sb = getSupabase();
+
+      // Get current agent_state to preserve it and set return_queue
+      const { data: freshItem } = await sb
+        .from('work_items')
+        .select('agent_state,queue_key')
+        .eq('id', currentItem.id)
+        .single();
+      const currentState = (freshItem as { agent_state: Record<string, unknown>; queue_key: string } | null)?.agent_state ?? {};
+      const currentQueue = (freshItem as { agent_state: Record<string, unknown>; queue_key: string } | null)?.queue_key ?? agent.queue_key;
+
+      await sb
+        .from('work_items')
+        .update({
+          agent_state: { ...currentState, pending_approval: pendingApproval, return_queue: currentQueue },
+          assignee: 'human',
+          queue_key: 'human_review',
+          review_reason: `Agent proposes: ${decision.action} (confidence ${decision.confidence.toFixed(2)}) — approve?`,
+          status: 'open',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', currentItem.id);
+
+      await sb.from('audit_log').insert({
+        work_item_id: currentItem.id,
+        actor,
+        action: 'propose_action',
+        detail: {
+          action: decision.action,
+          params: decision.params,
+          confidence: decision.confidence,
+          rationale: decision.rationale,
+        },
+      });
+
+      actions.push({ itemId: currentItem.id, action: 'propose_action', confidence: decision.confidence, actor });
+      break;
+    }
+
+    // ----- AUTONOMOUS mode: execute (default) -----
 
     // Add confidence to params for tools that store it
     const toolParams = { ...decision.params, confidence: decision.confidence };

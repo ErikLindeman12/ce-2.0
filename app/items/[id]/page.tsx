@@ -22,12 +22,22 @@ interface ExtractionMeta {
   fields: Record<string, ExtractionFieldMeta>;
 }
 
+interface PendingApproval {
+  action: string;
+  params: Record<string, unknown>;
+  confidence: number;
+  rationale: string;
+  agentId: string;
+  agentName: string;
+}
+
 interface AgentState {
   chase_plan?: ChasePlan;
   attempt_no?: number;
   last_channel?: string;
   kind?: string;
   extraction_meta?: ExtractionMeta;
+  pending_approval?: PendingApproval;
 }
 
 interface WorkItemDetail {
@@ -150,6 +160,106 @@ function getSourceText(item: WorkItemDetail['item']): string | null {
 }
 
 const QUEUE_KEYS = ['intake', 'referrals', 'roi_incoming', 'roi_outgoing', 'human_review'];
+
+// ---------------------------------------------------------------------------
+// Approval banner — shown when agent_state.pending_approval exists
+// ---------------------------------------------------------------------------
+
+function ApprovalBanner({
+  approval,
+  itemId,
+  onSettled,
+}: {
+  approval: PendingApproval;
+  itemId: string;
+  onSettled: () => void;
+}) {
+  const [inFlight, setInFlight] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  async function act(tool: 'approve_action' | 'reject_action') {
+    setInFlight(true);
+    setError(null);
+    try {
+      const res = await fetch(`/api/work-items/${itemId}/actions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ tool, params: {} }),
+      });
+      const body = (await res.json()) as { error?: string | { message?: string } };
+      if (!res.ok) {
+        const msg = typeof body.error === 'object' && body.error !== null
+          ? (body.error as { message?: string }).message ?? JSON.stringify(body.error)
+          : (body.error as string) ?? 'Action failed';
+        setError(msg);
+      } else {
+        onSettled();
+      }
+    } catch (e) {
+      setError(e instanceof Error ? e.message : 'Network error');
+    } finally {
+      setInFlight(false);
+    }
+  }
+
+  // Build a brief params summary (subject / body preview for sends; key=value otherwise)
+  const paramSummary = (() => {
+    const p = approval.params;
+    if (!p || Object.keys(p).length === 0) return null;
+    const parts: string[] = [];
+    if (typeof p.subject === 'string') parts.push(`Subject: "${p.subject.slice(0, 60)}"`);
+    if (typeof p.body === 'string') parts.push(`Body: "${p.body.slice(0, 80)}…"`);
+    if (parts.length === 0) {
+      for (const [k, v] of Object.entries(p).slice(0, 3)) {
+        parts.push(`${k}: ${String(v).slice(0, 40)}`);
+      }
+    }
+    return parts.join(' · ');
+  })();
+
+  return (
+    <div className="approval-banner">
+      <div className="approval-banner-header">
+        <span className="approval-banner-icon">🤖</span>
+        <div style={{ flex: 1 }}>
+          <div className="approval-banner-title">
+            <strong>{approval.agentName}</strong> proposes:{' '}
+            <span className="approval-banner-action">{approval.action}</span>
+            {' '}
+            <span className="approval-banner-confidence">
+              confidence {(approval.confidence * 100).toFixed(0)}%
+            </span>
+          </div>
+          {approval.rationale && (
+            <div className="approval-banner-rationale">{approval.rationale}</div>
+          )}
+          {paramSummary && (
+            <div className="approval-banner-params">{paramSummary}</div>
+          )}
+        </div>
+        <div className="approval-banner-actions">
+          <button
+            onClick={() => void act('approve_action')}
+            disabled={inFlight}
+            className="approval-btn approval-btn-approve"
+          >
+            {inFlight ? '…' : 'Approve'}
+          </button>
+          <button
+            onClick={() => void act('reject_action')}
+            disabled={inFlight}
+            className="approval-btn approval-btn-reject"
+          >
+            Reject
+          </button>
+        </div>
+      </div>
+      {error && (
+        <div className="approval-banner-error">{error}</div>
+      )}
+    </div>
+  );
+}
 
 // ---------------------------------------------------------------------------
 // Chase stepper header
@@ -1128,6 +1238,15 @@ export default function WorkItemDetailPage() {
           agentState={agentState}
           attempts={typedAttempts}
           itemStatus={item.status}
+        />
+      )}
+
+      {/* Approval banner — when supervised agent has a pending proposal */}
+      {agentState.pending_approval && (
+        <ApprovalBanner
+          approval={agentState.pending_approval}
+          itemId={id}
+          onSettled={() => void fetchDetail()}
         />
       )}
 

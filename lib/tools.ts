@@ -297,22 +297,29 @@ export const TOOLS: Record<string, ToolDef> = {
     description: 'Verify that an ROI request has patient, records description, and authorization.',
     async execute(workItemId, params, _actor) {
       const confidence = (params['confidence'] as number | undefined) ?? 0.8;
+      const requirements = params['requirements'] as Record<string, boolean> | undefined;
       const sb = getSupabase();
       const { data: item } = await sb
         .from('work_items')
-        .select('confidence')
+        .select('confidence,agent_state')
         .eq('id', workItemId)
         .single();
       const existingConf =
         (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
+      const existingState =
+        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
 
-      await sb
-        .from('work_items')
-        .update({
-          confidence: { ...existingConf, verify: confidence },
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', workItemId);
+      const updates: Record<string, unknown> = {
+        confidence: { ...existingConf, verify: confidence },
+        updated_at: new Date().toISOString(),
+      };
+
+      // Store requirements result in agent_state so the planner can check it
+      if (requirements) {
+        updates['agent_state'] = { ...existingState, requirements };
+      }
+
+      await sb.from('work_items').update(updates).eq('id', workItemId);
 
       return { success: true, data: params };
     },
@@ -359,13 +366,14 @@ export const TOOLS: Record<string, ToolDef> = {
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
       const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
+      const stateFlag = params['state_flag'] as string | undefined;
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
       const rendered = renderOutboundDocument('fax', kind, ctx);
       const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'fax', orgId, payload, actor, attemptNo, agentState);
+      const result = await sendViaChannel(workItemId, 'fax', orgId, payload, actor, attemptNo, agentState, stateFlag);
       console.log('[tool.send_fax]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -386,13 +394,14 @@ export const TOOLS: Record<string, ToolDef> = {
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
       const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
+      const stateFlag = params['state_flag'] as string | undefined;
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
       const rendered = renderOutboundDocument('email', kind, ctx);
       const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'email', orgId, payload, actor, attemptNo, agentState);
+      const result = await sendViaChannel(workItemId, 'email', orgId, payload, actor, attemptNo, agentState, stateFlag);
       console.log('[tool.send_email]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -413,13 +422,14 @@ export const TOOLS: Record<string, ToolDef> = {
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
       const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
+      const stateFlag = params['state_flag'] as string | undefined;
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
       const rendered = renderOutboundDocument('sms', kind, ctx);
       const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'sms', orgId, payload, actor, attemptNo, agentState);
+      const result = await sendViaChannel(workItemId, 'sms', orgId, payload, actor, attemptNo, agentState, stateFlag);
       console.log('[tool.send_sms]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -440,13 +450,14 @@ export const TOOLS: Record<string, ToolDef> = {
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
       const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
+      const stateFlag = params['state_flag'] as string | undefined;
 
       const contact = await getOrgContact(orgId);
       const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
       const rendered = renderOutboundDocument('voice', kind, ctx);
       const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'voice', orgId, payload, actor, attemptNo, agentState);
+      const result = await sendViaChannel(workItemId, 'voice', orgId, payload, actor, attemptNo, agentState, stateFlag);
       console.log('[tool.place_call]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -551,6 +562,117 @@ export const TOOLS: Record<string, ToolDef> = {
     },
   },
 
+  // ---- approve_action (human-only) ----------------------------------------
+  approve_action: {
+    description: 'Approve a pending supervised-mode agent proposal and execute it.',
+    async execute(workItemId, _params, actor) {
+      const sb = getSupabase();
+      const { data: item } = await sb
+        .from('work_items')
+        .select('agent_state')
+        .eq('id', workItemId)
+        .single();
+
+      const agentState =
+        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
+      const pending = agentState['pending_approval'] as
+        | {
+            action: string;
+            params: Record<string, unknown>;
+            confidence: number;
+            rationale: string;
+            agentId: string;
+            agentName: string;
+          }
+        | undefined;
+
+      if (!pending) {
+        return { success: false, error: 'No pending_approval on this item' };
+      }
+
+      const returnQueue = (agentState['return_queue'] as string | undefined) ?? 'intake';
+      const approvedActor = `human(approved:${pending.agentName})`;
+
+      // Execute the stored action
+      const result = await runTool(pending.action, workItemId, pending.params, approvedActor);
+
+      // Clear pending_approval and return to the original queue — but build the
+      // new agent_state from a FRESH read: the executed tool may have just
+      // written its own state (attempt_no, records_sent, …) and writing the
+      // pre-execution snapshot back would erase it and cause a re-proposal loop.
+      const { data: afterItem } = await sb
+        .from('work_items')
+        .select('agent_state,status')
+        .eq('id', workItemId)
+        .single();
+      const afterRow = afterItem as
+        | { agent_state: Record<string, unknown>; status: string }
+        | null;
+      const { return_queue: _rq, pending_approval: _pa, ...restState } =
+        (afterRow?.agent_state ?? agentState) as Record<string, unknown>;
+      void _rq; void _pa;
+      await sb
+        .from('work_items')
+        .update({
+          agent_state: restState,
+          queue_key: returnQueue,
+          assignee: 'unassigned',
+          review_reason: null,
+          // Preserve 'waiting' when the approved action was an outbound send
+          // (its respond/timeout lifecycle owns the item now).
+          status: afterRow?.status === 'waiting' ? 'waiting' : 'open',
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', workItemId);
+
+      console.log('[tool.approve_action]', JSON.stringify({ workItemId, action: pending.action, actor }));
+      return { success: true, data: { approved_action: pending.action, tool_result: result } };
+    },
+  },
+
+  // ---- reject_action (human-only) -----------------------------------------
+  reject_action: {
+    description: 'Reject a pending supervised-mode agent proposal and escalate for manual handling.',
+    async execute(workItemId, _params, _actor) {
+      const sb = getSupabase();
+      const { data: item } = await sb
+        .from('work_items')
+        .select('agent_state')
+        .eq('id', workItemId)
+        .single();
+
+      const agentState =
+        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
+      const pending = agentState['pending_approval'] as
+        | { action: string; agentName: string }
+        | undefined;
+
+      const actionName = pending?.action ?? 'unknown';
+
+      // Clear pending_approval and escalate
+      const { pending_approval: _pa, return_queue: _rq, ...restState } = agentState as Record<string, unknown>;
+      void _pa; void _rq;
+      await sb
+        .from('work_items')
+        .update({
+          agent_state: restState,
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', workItemId);
+
+      // Escalate with reason
+      const escalateResult = await runTool(
+        'escalate_to_human',
+        workItemId,
+        { question: `Proposed ${actionName} rejected — handle manually.` },
+        _actor,
+      );
+
+      console.log('[tool.reject_action]', JSON.stringify({ workItemId, rejectedAction: actionName }));
+      return { success: true, data: { rejected_action: actionName, escalate: escalateResult } };
+    },
+  },
+
   // ---- resolve_review (human-only) ----------------------------------------
   resolve_review: {
     description: 'Resolve a Human Review escalation: apply correction and route onward.',
@@ -645,6 +767,7 @@ async function sendViaChannel(
   _actor: string,
   attemptNo: number,
   currentAgentState?: Record<string, unknown>,
+  stateFlag?: string,
 ): Promise<ToolResult> {
   const contact = await getOrgContact(orgId);
   const contactSnapshot: Record<string, unknown> = {
@@ -678,10 +801,20 @@ async function sendViaChannel(
     agentState = (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
   }
 
+  const newState: Record<string, unknown> = {
+    ...agentState,
+    attempt_no: attemptNo,
+    last_channel: channel,
+  };
+  // Set a boolean flag in agent_state when requested (e.g. records_sent=true)
+  if (stateFlag) {
+    newState[stateFlag] = true;
+  }
+
   await getSupabase()
     .from('work_items')
     .update({
-      agent_state: { ...agentState, attempt_no: attemptNo, last_channel: channel },
+      agent_state: newState,
       updated_at: new Date().toISOString(),
     })
     .eq('id', workItemId);

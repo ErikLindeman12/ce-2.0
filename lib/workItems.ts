@@ -248,6 +248,7 @@ export async function createAgent(payload: {
   tools?: string[];
   confidence_threshold?: number;
   model?: string;
+  mode?: string;
 }) {
   const { data, error } = await getSupabase()
     .from('agents')

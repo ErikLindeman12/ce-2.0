@@ -634,3 +634,230 @@ button, input, select, textarea {
 .portal-offer-banner-btn:hover {
   background: #0f766e;
 }
+
+/* ============================================================
+   W3 agent builder — mode selector + mini-stats
+   ============================================================ */
+
+/* -- Three-state mode segmented control -- */
+.agent-mode-selector {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--color-border-strong);
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #f5f6f9;
+}
+
+.agent-mode-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding: 7px 14px;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--color-border-strong);
+  cursor: pointer;
+  transition: background var(--transition), color var(--transition), border-color var(--transition);
+  text-align: left;
+  min-width: 112px;
+}
+.agent-mode-btn:last-child {
+  border-right: none;
+}
+.agent-mode-btn:hover:not(.active) {
+  background: var(--color-border);
+}
+.agent-mode-btn.active {
+  /* Color overrides supplied via inline style per mode */
+  font-weight: 700;
+}
+
+.agent-mode-label {
+  font-size: 0.80rem;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.agent-mode-desc {
+  font-size: 0.68rem;
+  opacity: 0.75;
+  line-height: 1.3;
+  margin-top: 1px;
+  white-space: nowrap;
+}
+
+/* -- Per-agent mini-stats strip -- */
+.agent-mini-stats {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+  background: #f8f9fc;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-sm);
+  padding: 5px 12px;
+  margin-top: 6px;
+}
+
+.agent-mini-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+  padding: 0 10px;
+}
+.agent-mini-stat:first-child { padding-left: 0; }
+.agent-mini-stat:last-child  { padding-right: 0; }
+
+.agent-mini-stat-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--color-ink-faint);
+}
+.agent-mini-stat-value {
+  font-size: 0.88rem;
+  font-weight: 800;
+  color: var(--color-ink);
+  line-height: 1.2;
+}
+.agent-mini-stat-divider {
+  width: 1px;
+  height: 28px;
+  background: var(--color-border);
+  flex-shrink: 0;
+}
+
+/* Skeleton shimmer while stats load */
+@keyframes shimmer {
+  0%   { background-position: -200px 0; }
+  100% { background-position: 200px 0; }
+}
+.agent-mini-stats-skeleton {
+  gap: 8px;
+  padding: 6px 12px;
+}
+.agent-mini-stat-skel {
+  display: inline-block;
+  height: 18px;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, #e9ecf0 25%, #f3f4f6 50%, #e9ecf0 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.4s ease-in-out infinite;
+}
+
+/* ============================================================
+   W3 supervised-mode approval banner (items/[id])
+   ============================================================ */
+
+.approval-banner {
+  background: #fffbeb;
+  border: 2px solid #f59e0b;
+  border-radius: var(--radius);
+  padding: 16px 20px;
+  margin-bottom: 20px;
+  box-shadow: 0 2px 8px rgba(245,158,11,0.12);
+}
+
+.approval-banner-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 14px;
+}
+
+.approval-banner-icon {
+  font-size: 1.3rem;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+
+.approval-banner-title {
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: #78350f;
+  line-height: 1.4;
+}
+
+.approval-banner-action {
+  font-family: var(--font-mono);
+  font-size: 0.84rem;
+  background: #fde68a;
+  padding: 1px 6px;
+  border-radius: 3px;
+  color: #451a03;
+}
+
+.approval-banner-confidence {
+  font-size: 0.78rem;
+  font-weight: 700;
+  color: #92400e;
+  background: #fef3c7;
+  border: 1px solid #fcd34d;
+  border-radius: 99px;
+  padding: 1px 7px;
+}
+
+.approval-banner-rationale {
+  font-size: 0.82rem;
+  color: #92400e;
+  margin-top: 4px;
+  font-style: italic;
+  line-height: 1.45;
+}
+
+.approval-banner-params {
+  font-size: 0.76rem;
+  color: #78350f;
+  margin-top: 5px;
+  opacity: 0.80;
+  font-family: var(--font-mono);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.approval-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+.approval-btn {
+  padding: 8px 18px;
+  border: none;
+  border-radius: var(--radius-sm);
+  font-size: 0.84rem;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--transition), opacity var(--transition);
+}
+.approval-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.approval-btn-approve {
+  background: var(--color-success);
+  color: #fff;
+}
+.approval-btn-approve:not(:disabled):hover {
+  background: #15803d;
+}
+.approval-btn-reject {
+  background: var(--color-error);
+  color: #fff;
+}
+.approval-btn-reject:not(:disabled):hover {
+  background: #b91c1c;
+}
+
+.approval-banner-error {
+  margin-top: 10px;
+  padding: 7px 12px;
+  background: var(--color-error-bg);
+  border: 1px solid #fca5a5;
+  border-radius: var(--radius-sm);
+  color: var(--color-error);
+  font-size: 0.80rem;
+}

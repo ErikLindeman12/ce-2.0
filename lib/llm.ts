@@ -269,76 +269,247 @@ async function matchPatientHeuristic(
 }
 
 // ---------------------------------------------------------------------------
-// Heuristic decision engine — called per step of the agent pipeline
+// Generic planner — derives next action from agent.tools + item state.
+// First-match-wins per spec §1. Keeps all existing heuristic logic intact.
 // ---------------------------------------------------------------------------
+
+/** Channel preference order for send tools */
+const SEND_TOOL_ORDER = ['send_fax', 'send_email', 'send_sms', 'place_call'] as const;
+
+/** Pick the first allowed send tool, optionally preferring an org channel */
+function pickSendTool(
+  allowedTools: string[],
+  preferredChannel?: string,
+): string | null {
+  const channelToTool: Record<string, string> = {
+    fax: 'send_fax',
+    email: 'send_email',
+    sms: 'send_sms',
+    voice: 'place_call',
+    phone: 'place_call',
+  };
+  // Try preferred channel first
+  if (preferredChannel && preferredChannel !== 'portal') {
+    const preferred = channelToTool[preferredChannel];
+    if (preferred && allowedTools.includes(preferred)) return preferred;
+  }
+  // Fall back through ordered list
+  for (const tool of SEND_TOOL_ORDER) {
+    if (allowedTools.includes(tool)) return tool;
+  }
+  return null;
+}
 
 async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
   const { workItem, agent, stepHistory } = input;
+  const tools = agent.tools;
   const alreadyDone = new Set(stepHistory);
   const text = workItem.source_text ?? '';
   const extracted = workItem.extracted_data as Record<string, string>;
+  const agentState = workItem.agent_state as Record<string, unknown>;
+  const confidence = workItem.confidence as Record<string, number>;
 
-  // --- INTAKE pipeline ---
-  if (agent.queue_key === 'intake') {
-    // Step 1: classify
-    if (!alreadyDone.has('classify_document')) {
-      const { type, confidence } = classifyHeuristic(text);
+  // -----------------------------------------------------------------------
+  // Rule 1: classify_document allowed AND confidence.classify absent
+  // -----------------------------------------------------------------------
+  if (tools.includes('classify_document') && confidence['classify'] === undefined) {
+    const { type, confidence: conf } = classifyHeuristic(text);
+    return {
+      action: 'classify_document',
+      params: { document_type: type },
+      confidence: conf,
+      rationale: `Heuristic classification: ${type} (confidence ${conf.toFixed(2)})`,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Rule 2: extract_fields allowed AND confidence.extract absent
+  // -----------------------------------------------------------------------
+  if (tools.includes('extract_fields') && confidence['extract'] === undefined) {
+    const { fields, confidence: conf, extraction_meta } = extractHeuristic(text);
+    return {
+      action: 'extract_fields',
+      params: { fields, extraction_meta },
+      confidence: conf,
+      rationale: `Heuristic extraction: found ${Object.keys(fields).length} fields (confidence ${conf.toFixed(2)})`,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Rule 3: match_patient allowed AND no matched_patient_id
+  // -----------------------------------------------------------------------
+  if (tools.includes('match_patient') && !workItem.matched_patient_id) {
+    const result = await matchPatientHeuristic(extracted);
+    return {
+      action: 'match_patient',
+      params: {
+        patient_id: result.patientId,
+        candidates: result.candidates,
+      },
+      confidence: result.confidence,
+      rationale: `Heuristic patient match: confidence ${result.confidence.toFixed(2)}`,
+      question: result.question,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Rule 4: verify_requirements allowed AND records_request_in AND
+  //         agent_state.requirements absent
+  // -----------------------------------------------------------------------
+  if (
+    tools.includes('verify_requirements') &&
+    workItem.type === 'records_request_in' &&
+    agentState['requirements'] === undefined
+  ) {
+    const hasPatient = !!workItem.matched_patient_id;
+    const hasRecords = !!(extracted['records_requested'] as string | undefined);
+    const hasAuth =
+      !!(extracted['authorization'] as string | undefined) &&
+      !/to follow/i.test((extracted['authorization'] as string) ?? '');
+    const completeness = [hasPatient, hasRecords, hasAuth].filter(Boolean).length / 3;
+    const conf = hasPatient ? 0.95 : 0.5;
+    return {
+      action: 'verify_requirements',
+      params: {
+        has_patient: hasPatient,
+        has_records: hasRecords,
+        has_auth: hasAuth,
+        // Store result in agent_state.requirements (tool updated to do this)
+        requirements: { has_patient: hasPatient, has_records: hasRecords, has_auth: hasAuth },
+      },
+      confidence: conf,
+      rationale: `Requirements: patient=${hasPatient}, records=${hasRecords}, auth=${hasAuth} — completeness ${(completeness * 100).toFixed(0)}%`,
+      question: !hasPatient
+        ? 'No matched patient on this records request — verify identity before releasing records.'
+        : undefined,
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Rule 5: request_more_info allowed AND requirements verified with missing
+  //         auth AND NOT agent_state.more_info_sent
+  // -----------------------------------------------------------------------
+  if (
+    tools.includes('request_more_info') &&
+    agentState['requirements'] !== undefined &&
+    !(agentState['requirements'] as Record<string, boolean>)['has_auth'] &&
+    !agentState['more_info_sent']
+  ) {
+    return {
+      action: 'request_more_info',
+      params: { reason: 'Missing patient authorization. Please provide signed authorization form.' },
+      confidence: 0.92,
+      rationale: 'Auth missing — sending request_more_info outbound',
+    };
+  }
+
+  // -----------------------------------------------------------------------
+  // Rule 6: Fulfillment send — records_request_in, requirements complete
+  //         (has_auth true), NOT agent_state.records_sent
+  // -----------------------------------------------------------------------
+  if (
+    workItem.type === 'records_request_in' &&
+    agentState['requirements'] !== undefined &&
+    (agentState['requirements'] as Record<string, boolean>)['has_auth'] &&
+    !agentState['records_sent']
+  ) {
+    // Determine preferred channel from org contact (stored in extracted_data or
+    // agent_state.return_channel, fallback to fax for the tool picker)
+    const preferredChannel =
+      (extracted['return_channel'] as string | undefined) ??
+      (agentState['org_preferred_channel'] as string | undefined);
+    const sendTool = pickSendTool(tools, preferredChannel);
+    if (sendTool) {
       return {
-        action: 'classify_document',
-        params: { document_type: type },
-        confidence,
-        rationale: `Heuristic classification: ${type} (confidence ${confidence.toFixed(2)})`,
+        action: sendTool,
+        params: { state_flag: 'records_sent' },
+        confidence: 0.92,
+        rationale: `Requirements verified — sending records via ${sendTool}`,
       };
     }
+  }
 
-    // Step 2: extract
-    if (!alreadyDone.has('extract_fields')) {
-      const { fields, confidence, extraction_meta } = extractHeuristic(text);
+  // -----------------------------------------------------------------------
+  // Rule 7: Initial outbound for records_request_out (no agent_state.attempt_no)
+  // -----------------------------------------------------------------------
+  if (
+    workItem.type === 'records_request_out' &&
+    !agentState['attempt_no'] &&
+    !agentState['response_received']
+  ) {
+    const chasePlan = agentState['chase_plan'] as { channels?: string[] } | undefined;
+    const preferredChannel = chasePlan?.channels?.[0];
+    const sendTool = pickSendTool(tools, preferredChannel);
+    if (sendTool) {
       return {
-        action: 'extract_fields',
-        params: { fields, extraction_meta },
-        confidence,
-        rationale: `Heuristic extraction: found ${Object.keys(fields).length} fields (confidence ${confidence.toFixed(2)})`,
+        action: sendTool,
+        params: {},
+        confidence: 0.9,
+        rationale: 'Fresh outgoing ROI — sending initial request via preferred channel',
       };
     }
+  }
 
-    // Step 3: match patient
-    if (!alreadyDone.has('match_patient')) {
-      const result = await matchPatientHeuristic(extracted);
-      return {
-        action: 'match_patient',
-        params: {
-          patient_id: result.patientId,
-          candidates: result.candidates,
-        },
-        confidence: result.confidence,
-        rationale: `Heuristic patient match: confidence ${result.confidence.toFixed(2)}`,
-        question: result.question,
-      };
-    }
-
-    // Step 4: advance stage — only if match confidence was high enough
+  // -----------------------------------------------------------------------
+  // Rule 8: mark_complete allowed AND
+  //   (records_request_out with response_received, OR records_request_in with records_sent)
+  // -----------------------------------------------------------------------
+  if (tools.includes('mark_complete')) {
     if (
-      !alreadyDone.has('advance_stage') &&
-      !alreadyDone.has('escalate_to_human')
+      workItem.type === 'records_request_out' &&
+      agentState['response_received'] &&
+      !alreadyDone.has('mark_complete')
     ) {
-      const itemType = workItem.type;
-      const targetQueue =
-        itemType === 'referral'
-          ? 'referrals'
-          : itemType === 'records_request_in'
-            ? 'roi_incoming'
-            : null;
+      const refNo = `ROI-${workItem.id.slice(0, 8).toUpperCase()}`;
+      const lastChannel = (agentState['last_channel'] as string | undefined) ?? 'unknown';
+      return {
+        action: 'mark_complete',
+        params: { note: `Records received via ${lastChannel} — ref ${refNo}.` },
+        confidence: 0.98,
+        rationale: 'Response received — marking complete',
+      };
+    }
+    if (
+      workItem.type === 'records_request_in' &&
+      agentState['records_sent'] &&
+      !alreadyDone.has('mark_complete')
+    ) {
+      return {
+        action: 'mark_complete',
+        params: { note: 'Records sent to requester.' },
+        confidence: 0.98,
+        rationale: 'Records sent — marking complete',
+      };
+    }
+  }
 
-      if (targetQueue) {
-        return {
-          action: 'advance_stage',
-          params: { queue_key: targetQueue, type: itemType },
-          confidence: 0.95,
-          rationale: `Routing ${itemType} to ${targetQueue}`,
-        };
-      }
+  // -----------------------------------------------------------------------
+  // Rule 9: advance_stage allowed AND queue is intake AND type known
+  // -----------------------------------------------------------------------
+  if (
+    tools.includes('advance_stage') &&
+    workItem.queue_key === 'intake' &&
+    !alreadyDone.has('advance_stage') &&
+    !alreadyDone.has('escalate_to_human')
+  ) {
+    const itemType = workItem.type;
+    const targetQueue =
+      itemType === 'referral'
+        ? 'referrals'
+        : itemType === 'records_request_in'
+          ? 'roi_incoming'
+          : null;
 
+    if (targetQueue) {
+      return {
+        action: 'advance_stage',
+        params: { queue_key: targetQueue, type: itemType },
+        confidence: 0.95,
+        rationale: `Routing ${itemType} to ${targetQueue}`,
+      };
+    }
+
+    if (tools.includes('escalate_to_human')) {
       return {
         action: 'escalate_to_human',
         params: {
@@ -350,126 +521,9 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
     }
   }
 
-  // --- ROI INCOMING pipeline ---
-  if (agent.queue_key === 'roi_incoming') {
-    // Step 1: verify requirements
-    if (!alreadyDone.has('verify_requirements')) {
-      const hasPatient = !!workItem.matched_patient_id;
-      const hasRecords =
-        !!(extracted['records_requested'] as string | undefined);
-      const hasAuth =
-        !!(extracted['authorization'] as string | undefined) &&
-        !/to follow/i.test((extracted['authorization'] as string) ?? '');
-      const completeness = [hasPatient, hasRecords, hasAuth].filter(Boolean).length / 3;
-      // Determining WHICH requirements are missing is a high-confidence finding;
-      // what to do about a gap is decided in the next step (request_more_info).
-      // Only an unmatched patient is a genuine uncertainty worth escalating here.
-      const confidence = hasPatient ? 0.95 : 0.5;
-      return {
-        action: 'verify_requirements',
-        params: { has_patient: hasPatient, has_records: hasRecords, has_auth: hasAuth },
-        confidence,
-        rationale: `Requirements: patient=${hasPatient}, records=${hasRecords}, auth=${hasAuth} — completeness ${(completeness * 100).toFixed(0)}%`,
-        question: !hasPatient ? 'No matched patient on this records request — verify identity before releasing records.' : undefined,
-      };
-    }
-
-    // Step 2a: request more info if auth missing
-    const agentState = workItem.agent_state as Record<string, unknown>;
-    if (
-      !alreadyDone.has('request_more_info') &&
-      !alreadyDone.has('send_fax') &&
-      !alreadyDone.has('send_email')
-    ) {
-      const hasAuth =
-        !!(extracted['authorization'] as string | undefined) &&
-        !/to follow/i.test((extracted['authorization'] as string) ?? '');
-      if (!hasAuth && !agentState['more_info_sent']) {
-        return {
-          action: 'request_more_info',
-          params: { reason: 'Missing patient authorization. Please provide signed authorization form.' },
-          confidence: 0.92,
-          rationale: 'Auth missing — sending request_more_info outbound',
-        };
-      }
-    }
-
-    // Step 2b: send records back
-    if (
-      !alreadyDone.has('send_fax') &&
-      !alreadyDone.has('send_email') &&
-      !alreadyDone.has('mark_complete')
-    ) {
-      const hasAuth =
-        !!(extracted['authorization'] as string | undefined) &&
-        !/to follow/i.test((extracted['authorization'] as string) ?? '');
-      if (hasAuth) {
-        // Decide channel based on org preferred channel — default to fax
-        return {
-          action: 'send_fax',
-          params: { subject: 'Records Response', body: 'Requested records are attached.' },
-          confidence: 0.92,
-          rationale: 'Requirements verified — sending records via preferred channel',
-        };
-      }
-    }
-
-    // Step 3: mark complete
-    if (
-      !alreadyDone.has('mark_complete') &&
-      (alreadyDone.has('send_fax') || alreadyDone.has('send_email'))
-    ) {
-      return {
-        action: 'mark_complete',
-        params: { note: 'Records sent to requester.' },
-        confidence: 0.98,
-        rationale: 'Records sent — marking complete',
-      };
-    }
-  }
-
-  // --- ROI OUTGOING pipeline ---
-  if (agent.queue_key === 'roi_outgoing') {
-    const agentState = workItem.agent_state as Record<string, unknown>;
-    const refNo = `ROI-${workItem.id.slice(0, 8).toUpperCase()}`;
-
-    // Response arrived (tick reopened the item) — close it out
-    if (agentState['response_received'] && !alreadyDone.has('mark_complete')) {
-      const lastChannel = (agentState['last_channel'] as string | undefined) ?? 'unknown';
-      return {
-        action: 'mark_complete',
-        params: { note: `Records received via ${lastChannel} — ref ${refNo}.` },
-        confidence: 0.98,
-        rationale: 'Response received — marking complete',
-      };
-    }
-
-    // Initial send on a fresh item — agent_state.attempt_no is the durable
-    // guard (stepHistory only covers this run; retries are owned by tick()).
-    if (
-      !agentState['attempt_no'] &&
-      !alreadyDone.has('send_fax') &&
-      !alreadyDone.has('send_email') &&
-      !alreadyDone.has('send_sms') &&
-      !alreadyDone.has('place_call')
-    ) {
-      // The send tool will use renderOutboundDocument via the tool registry.
-      // The channel is determined from the org's preferred_channel (set on the
-      // item's org_id). We always return send_fax here as the initial action —
-      // the actual channel used is determined inside the tool by looking up the
-      // org's preferred_channel from agent_state.chase_plan.channels[0].
-      return {
-        action: 'send_fax',
-        params: {},
-        confidence: 0.9,
-        rationale: 'Fresh outgoing ROI — sending initial request via preferred channel',
-      };
-    }
-  }
-
-  // Fallback — nothing actionable right now (e.g. awaiting an outbound
-  // response). A no-op, NOT an escalation: escalating here would flood
-  // Human Review every tick for items that are simply waiting.
+  // -----------------------------------------------------------------------
+  // Rule 10: wait fallback
+  // -----------------------------------------------------------------------
   return {
     action: 'wait',
     params: {},
