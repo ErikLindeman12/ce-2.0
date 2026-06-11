@@ -79,6 +79,28 @@ The most polished path; lead the demo with it.
 
 ---
 
+## ⭐ Workflow 4 showcase — Configurable agents (the low-code story)
+
+1. **The configuration IS the policy** (`/agents`): uncheck `send_fax` on the
+   ROI Fulfillment Agent, inject a clean ROI fax — records go out by *email*.
+   No code changed; the tool checklist is the behavior.
+2. **The autonomy ladder** — each agent has a three-state mode:
+   - **Shadow**: the agent logs what it *would* do (audit shows
+     `shadow_decision` entries) but never touches the item — run a new agent
+     in shadow for a week before trusting it.
+   - **Supervised**: annotation steps (classify/extract/match/verify) run
+     free, but externally-acting tools pause for approval — the item lands in
+     Human Review with an amber banner: *"ROI Fulfillment Agent proposes:
+     send_fax (0.92)"* + rationale. **Approve** executes it (audit actor
+     `human(approved:ROI Fulfillment Agent)`); **Reject** escalates.
+   - **Autonomous**: acts on anything above the confidence threshold.
+   Mode + the threshold slider = shadow → supervised → autonomous without
+   rebuilding anything.
+3. **Per-agent supervision stats** on each card: processed, auto-rate %,
+   escalations, proposals — the "agents did X% of the work" number, per agent.
+
+---
+
 ## Setup (run once before the demo)
 
 ```bash
