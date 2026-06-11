@@ -9,6 +9,7 @@
  */
 
 import { getSupabase } from './supabase';
+import { renderOutboundDocument, type Channel, type DocumentKind } from './outbound';
 import type { ToolDef, ToolResult, OutboundChannel } from './types';
 
 // ---------------------------------------------------------------------------
@@ -30,11 +31,11 @@ async function audit(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: random delay for simulated outbound respond_after (20-40 seconds)
+// Helper: simulated outbound respond_after (default 20-40s)
 // ---------------------------------------------------------------------------
 
-function respondAfter(): string {
-  const seconds = 20 + Math.floor(Math.random() * 21); // 20–40s
+function respondAfter(waitSeconds?: number): string {
+  const seconds = waitSeconds ?? (20 + Math.floor(Math.random() * 21));
   return new Date(Date.now() + seconds * 1000).toISOString();
 }
 
@@ -60,6 +61,7 @@ async function getOrgContact(orgId: string | null): Promise<{
 
 // ---------------------------------------------------------------------------
 // Helper: create an outbound attempt and set work item to waiting
+// portal channel → respond_after = null (never auto-timed-out by tick)
 // ---------------------------------------------------------------------------
 
 async function createOutboundAttempt(
@@ -67,10 +69,13 @@ async function createOutboundAttempt(
   channel: OutboundChannel,
   orgId: string | null,
   contactSnapshot: Record<string, unknown>,
-  payload: { subject: string; body: string },
+  payload: { subject: string; body: string; document?: string; kind?: string },
   attemptNo: number = 1,
+  waitSeconds?: number,
 ): Promise<string> {
   const sb = getSupabase();
+  const isPortal = channel === 'portal';
+
   const { data, error } = await sb
     .from('outbound_attempts')
     .insert({
@@ -81,7 +86,7 @@ async function createOutboundAttempt(
       to_contact: contactSnapshot,
       payload,
       status: 'sent',
-      respond_after: respondAfter(),
+      respond_after: isPortal ? null : respondAfter(waitSeconds),
     })
     .select('id')
     .single();
@@ -98,39 +103,79 @@ async function createOutboundAttempt(
 }
 
 // ---------------------------------------------------------------------------
-// Helper: send via preferred channel
+// Helper: build outbound context from a work item for document rendering
 // ---------------------------------------------------------------------------
 
-async function sendViaPreferredChannel(
+async function buildOutboundContext(
   workItemId: string,
   orgId: string | null,
-  payload: { subject: string; body: string },
-  actor: string,
-  attemptNo: number = 1,
-): Promise<ToolResult> {
-  const contact = await getOrgContact(orgId);
-  const preferredChannel = (contact?.preferred_channel ?? 'fax') as OutboundChannel;
-  const contactSnapshot: Record<string, unknown> = {
-    fax: contact?.fax,
-    email: contact?.email,
-    phone: contact?.phone,
-  };
+  attemptNo: number,
+  contact: { fax?: string; email?: string; phone?: string } | null,
+): Promise<import('./outbound').OutboundContext> {
+  const sb = getSupabase();
 
-  const attemptId = await createOutboundAttempt(
-    workItemId,
-    preferredChannel,
-    orgId,
-    contactSnapshot,
-    payload,
+  const { data: itemData } = await sb
+    .from('work_items')
+    .select('id,extracted_data,matched_patient_id,org_id')
+    .eq('id', workItemId)
+    .single();
+
+  const item = itemData as {
+    id: string;
+    extracted_data: Record<string, string>;
+    matched_patient_id: string | null;
+    org_id: string | null;
+  } | null;
+
+  const extracted = item?.extracted_data ?? {};
+
+  let patientName = 'Unknown Patient';
+  let patientDob: string | undefined;
+  let patientMrn: string | undefined;
+
+  if (item?.matched_patient_id) {
+    const { data: pat } = await sb
+      .from('patients')
+      .select('first_name,last_name,dob,mrn')
+      .eq('id', item.matched_patient_id)
+      .single();
+    const p = pat as { first_name: string; last_name: string; dob: string; mrn: string } | null;
+    if (p) {
+      patientName = `${p.first_name} ${p.last_name}`;
+      patientDob = p.dob;
+      patientMrn = p.mrn;
+    }
+  } else {
+    const fn = (extracted['patient_first_name'] ?? extracted['patient_name'] ?? '') as string;
+    const ln = (extracted['patient_last_name'] ?? '') as string;
+    if (fn || ln) patientName = `${fn} ${ln}`.trim();
+    patientDob = (extracted['patient_dob'] ?? undefined) as string | undefined;
+    patientMrn = (extracted['patient_mrn'] ?? undefined) as string | undefined;
+  }
+
+  // Org name
+  let orgName = (extracted['org_name'] ?? '') as string;
+  if (!orgName && orgId) {
+    const { data: orgRow } = await sb
+      .from('organizations')
+      .select('name')
+      .eq('id', orgId)
+      .single();
+    orgName = (orgRow as { name: string } | null)?.name ?? 'Unknown Org';
+  }
+
+  return {
+    itemId: workItemId,
+    patientName,
+    patientDob,
+    patientMrn,
+    recordsRequested: (extracted['records_requested'] ?? undefined) as string | undefined,
+    orgName,
+    orgFax: contact?.fax,
+    orgEmail: contact?.email,
+    orgPhone: contact?.phone,
     attemptNo,
-  );
-
-  console.log(
-    `[tool.${preferredChannel}_via_preferred]`,
-    JSON.stringify({ workItemId, attemptId, orgId, channel: preferredChannel }),
-  );
-
-  return { success: true, data: { attempt_id: attemptId, channel: preferredChannel } };
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -303,13 +348,14 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
+      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
 
-      const payload = {
-        subject: (params['subject'] as string | undefined) ?? 'Fax',
-        body: (params['body'] as string | undefined) ?? '',
-      };
+      const contact = await getOrgContact(orgId);
+      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
+      const rendered = renderOutboundDocument('fax', kind, ctx);
+      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'fax', orgId, payload, actor, attemptNo);
+      const result = await sendViaChannel(workItemId, 'fax', orgId, payload, actor, attemptNo, agentState);
       console.log('[tool.send_fax]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -329,13 +375,14 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
+      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
 
-      const payload = {
-        subject: (params['subject'] as string | undefined) ?? 'Email',
-        body: (params['body'] as string | undefined) ?? '',
-      };
+      const contact = await getOrgContact(orgId);
+      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
+      const rendered = renderOutboundDocument('email', kind, ctx);
+      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'email', orgId, payload, actor, attemptNo);
+      const result = await sendViaChannel(workItemId, 'email', orgId, payload, actor, attemptNo, agentState);
       console.log('[tool.send_email]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -355,13 +402,14 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
+      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
 
-      const payload = {
-        subject: 'SMS',
-        body: (params['body'] as string | undefined) ?? 'Records requested.',
-      };
+      const contact = await getOrgContact(orgId);
+      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
+      const rendered = renderOutboundDocument('sms', kind, ctx);
+      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'sms', orgId, payload, actor, attemptNo);
+      const result = await sendViaChannel(workItemId, 'sms', orgId, payload, actor, attemptNo, agentState);
       console.log('[tool.send_sms]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -381,13 +429,14 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
+      const kind: DocumentKind = (agentState['kind'] as DocumentKind | undefined) ?? 'records_request';
 
-      const payload = {
-        subject: 'Voice call',
-        body: (params['message'] as string | undefined) ?? 'Records requested.',
-      };
+      const contact = await getOrgContact(orgId);
+      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
+      const rendered = renderOutboundDocument('voice', kind, ctx);
+      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
 
-      const result = await sendViaChannel(workItemId, 'voice', orgId, payload, actor, attemptNo);
+      const result = await sendViaChannel(workItemId, 'voice', orgId, payload, actor, attemptNo, agentState);
       console.log('[tool.place_call]', JSON.stringify({ workItemId, orgId, attemptNo }));
       return result;
     },
@@ -397,8 +446,6 @@ export const TOOLS: Record<string, ToolDef> = {
   request_more_info: {
     description: 'Send an outbound request for more information to the requesting org.',
     async execute(workItemId, params, actor) {
-      const reason = (params['reason'] as string | undefined) ?? 'More information required.';
-
       const { data: item } = await getSupabase()
         .from('work_items')
         .select('org_id, agent_state')
@@ -409,19 +456,26 @@ export const TOOLS: Record<string, ToolDef> = {
       const agentState =
         (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
 
-      const payload = {
-        subject: 'Request for Additional Information',
-        body: reason,
-      };
-
       const contact = await getOrgContact(orgId);
-      const channel = (contact?.preferred_channel ?? 'fax') as OutboundChannel;
+      const rawChannel = contact?.preferred_channel ?? 'fax';
+      // portal orgs: fall back to fax for more-info since portal is handled differently
+      const channel = (rawChannel === 'portal' ? 'fax' : rawChannel) as OutboundChannel;
       const contactSnapshot: Record<string, unknown> = {
         fax: contact?.fax,
         email: contact?.email,
+        phone: contact?.phone,
       };
 
       const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
+      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
+      const rendered = renderOutboundDocument(channel as Channel, 'request_more_info', ctx);
+      const payload = {
+        subject: rendered.subject,
+        body: rendered.body,
+        document: rendered.document,
+        kind: 'request_more_info',
+      };
+
       const attemptId = await createOutboundAttempt(
         workItemId,
         channel,
@@ -440,8 +494,8 @@ export const TOOLS: Record<string, ToolDef> = {
         })
         .eq('id', workItemId);
 
-      console.log('[tool.request_more_info]', JSON.stringify({ workItemId, reason, attemptId }));
-      return { success: true, data: { attempt_id: attemptId, channel, reason } };
+      console.log('[tool.request_more_info]', JSON.stringify({ workItemId, attemptId }));
+      return { success: true, data: { attempt_id: attemptId, channel, kind: 'request_more_info' } };
     },
   },
 
@@ -546,9 +600,10 @@ async function sendViaChannel(
   workItemId: string,
   channel: OutboundChannel,
   orgId: string | null,
-  payload: { subject: string; body: string },
+  payload: { subject: string; body: string; document?: string; kind?: string },
   _actor: string,
   attemptNo: number,
+  currentAgentState?: Record<string, unknown>,
 ): Promise<ToolResult> {
   const contact = await getOrgContact(orgId);
   const contactSnapshot: Record<string, unknown> = {
@@ -557,6 +612,10 @@ async function sendViaChannel(
     phone: contact?.phone,
   };
 
+  // Inherit waitSeconds from chase_plan if present
+  const chasePlan = (currentAgentState?.['chase_plan'] as { waitSeconds?: number } | undefined);
+  const waitSeconds = chasePlan?.waitSeconds;
+
   const attemptId = await createOutboundAttempt(
     workItemId,
     channel,
@@ -564,16 +623,20 @@ async function sendViaChannel(
     contactSnapshot,
     payload,
     attemptNo,
+    waitSeconds,
   );
 
-  // Track attempt_no in agent_state
-  const { data: item } = await getSupabase()
-    .from('work_items')
-    .select('agent_state')
-    .eq('id', workItemId)
-    .single();
-  const agentState =
-    (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
+  // Read current agent_state if not provided
+  let agentState = currentAgentState;
+  if (!agentState) {
+    const { data: item } = await getSupabase()
+      .from('work_items')
+      .select('agent_state')
+      .eq('id', workItemId)
+      .single();
+    agentState = (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
+  }
+
   await getSupabase()
     .from('work_items')
     .update({

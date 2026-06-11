@@ -13,9 +13,10 @@ interface OrgRow {
   state: string | null;
   zip: string | null;
   active: boolean;
+  contact: Record<string, string> | null;
 }
 
-function toOrg(r: OrgRow): Org {
+function toOrg(r: OrgRow): Org & { contact: Record<string, string> | null } {
   return {
     id: r.id,
     name: r.name,
@@ -27,13 +28,14 @@ function toOrg(r: OrgRow): Org {
     state: r.state,
     zip: r.zip,
     active: r.active,
+    contact: r.contact ?? null,
   };
 }
 
-export async function searchOrgs(filters: DirectoryFilters = {}): Promise<Org[]> {
+export async function searchOrgs(filters: DirectoryFilters = {}): Promise<(Org & { contact: Record<string, string> | null })[]> {
   let qb = getSupabase()
     .from('organizations')
-    .select('id,name,tenant_slug,endpoint_url,channels,data_types,specialties,city,state,zip,active')
+    .select('id,name,tenant_slug,endpoint_url,channels,data_types,specialties,city,state,zip,active,contact')
     .eq('active', true);
 
   if (filters.specialty) {

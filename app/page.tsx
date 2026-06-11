@@ -21,7 +21,6 @@ export default function SearchPage() {
     }
   }
 
-  // Initial load + debounced search on each keystroke.
   useEffect(() => {
     const t = setTimeout(() => runSearch(query), 200);
     return () => clearTimeout(t);
@@ -49,73 +48,56 @@ export default function SearchPage() {
 
   return (
     <div>
-      <h1 style={{ fontSize: '1.75rem', fontWeight: 800, margin: '0 0 6px' }}>Organization Directory</h1>
-      <p style={{ color: '#6b7280', marginTop: 0, marginBottom: '24px' }}>
+      <h1 style={{ fontSize: '1.6rem', fontWeight: 800, margin: '0 0 4px', color: 'var(--color-ink)' }}>
+        Organization Directory
+      </h1>
+      <p style={{ color: 'var(--color-ink-muted)', marginTop: 0, marginBottom: '24px', fontSize: '0.88rem' }}>
         Search connected organizations and send a referral.
       </p>
 
       <input
         type="text"
+        className="input"
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         placeholder="Search by name, slug, or data type (e.g. imaging)…"
-        style={{
-          width: '100%',
-          padding: '12px 14px',
-          border: '1px solid #d1d5db',
-          borderRadius: '8px',
-          fontSize: '1rem',
-          marginBottom: '20px',
-        }}
+        style={{ marginBottom: '20px' }}
       />
 
-      {loading && <p style={{ color: '#9ca3af', fontSize: '0.85rem' }}>Searching…</p>}
+      {loading && <p style={{ color: 'var(--color-ink-faint)', fontSize: '0.84rem' }}>Searching…</p>}
       {!loading && orgs.length === 0 && (
-        <p style={{ color: '#9ca3af' }}>No organizations match “{query}”.</p>
+        <div className="card" style={{ textAlign: 'center', padding: '40px 32px' }}>
+          <div style={{ fontSize: '1.8rem', marginBottom: '8px' }}>🏥</div>
+          <p style={{ color: 'var(--color-ink-muted)', margin: 0, fontWeight: 600 }}>
+            {query ? `No organizations match "${query}".` : 'No organizations yet.'}
+          </p>
+        </div>
       )}
 
-      <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: '10px' }}>
         {orgs.map((org) => (
           <div
             key={org.id}
-            style={{
-              display: 'flex',
-              justifyContent: 'space-between',
-              alignItems: 'center',
-              gap: '16px',
-              padding: '16px 20px',
-              background: '#fff',
-              border: '1px solid #e5e7eb',
-              borderRadius: '10px',
-              boxShadow: '0 1px 3px rgba(0,0,0,0.06)',
-            }}
+            className="card"
+            style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '16px' }}
           >
             <div>
-              <div style={{ fontWeight: 700, fontSize: '1rem' }}>{org.name}</div>
-              <div style={{ color: '#6b7280', fontSize: '0.82rem', marginTop: '2px' }}>
+              <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{org.name}</div>
+              <div style={{ color: 'var(--color-ink-muted)', fontSize: '0.80rem', marginTop: '2px' }}>
                 {org.tenantSlug} · {org.capabilities.dataTypes.join(', ')}
               </div>
             </div>
 
             {sentFor[org.id] ? (
-              <span style={{ color: '#059669', fontSize: '0.82rem', fontWeight: 600, whiteSpace: 'nowrap' }}>
+              <span className="badge badge-success" style={{ whiteSpace: 'nowrap' }}>
                 ✓ Referral sent
               </span>
             ) : (
               <button
-                onClick={() => sendReferral(org)}
+                onClick={() => void sendReferral(org)}
                 disabled={sending === org.id}
-                style={{
-                  padding: '8px 16px',
-                  background: sending === org.id ? '#93c5fd' : '#1e3a5f',
-                  color: '#fff',
-                  border: 'none',
-                  borderRadius: '6px',
-                  fontSize: '0.85rem',
-                  fontWeight: 600,
-                  cursor: sending === org.id ? 'default' : 'pointer',
-                  whiteSpace: 'nowrap',
-                }}
+                className="btn btn-primary"
+                style={{ opacity: sending === org.id ? 0.6 : 1 }}
               >
                 {sending === org.id ? 'Sending…' : 'Send referral'}
               </button>

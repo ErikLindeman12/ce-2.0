@@ -5,75 +5,90 @@ import { useParams, useRouter } from 'next/navigation';
 import type { WorkItem, AuditLogEntry, OutboundAttempt, Patient } from '@/lib/types';
 
 // ---------------------------------------------------------------------------
-// Types matching the API contract from the spec
+// Extended types
 // ---------------------------------------------------------------------------
 
+interface ChasePlan {
+  channels: string[];
+  waitSeconds: number;
+}
+
+interface AgentState {
+  chase_plan?: ChasePlan;
+  attempt_no?: number;
+  last_channel?: string;
+  kind?: string;
+}
+
 interface WorkItemDetail {
-  item: WorkItem & { sourceText?: string; agentState?: Record<string, unknown> };
+  item: WorkItem & {
+    sourceText?: string;
+    source_text?: string;
+    agentState?: AgentState | Record<string, unknown>;
+    agent_state?: AgentState | Record<string, unknown>;
+  };
   audit: AuditLogEntry[];
+  auditTrail?: AuditLogEntry[];
   attempts: OutboundAttempt[];
+  outboundAttempts?: OutboundAttempt[];
   patientCandidates: Patient[];
+}
+
+// Attempts carry payload.document and richer response
+interface AttemptWithDoc extends OutboundAttempt {
+  payload: {
+    document?: string;
+    subject?: string;
+    body?: string;
+    kind?: string;
+    [key: string]: unknown;
+  };
+  response: {
+    summary?: string;
+    message?: string;
+    document?: string;
+    outcome?: string;
+    note?: string;
+    status?: string;
+    received_at?: string;
+    authorization?: string;
+    [key: string]: unknown;
+  } | null;
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-function confidenceColor(score: number): string {
-  if (score >= 0.8) return '#059669';
-  if (score >= 0.5) return '#d97706';
-  return '#dc2626';
-}
+const CHANNEL_ICONS: Record<string, string> = {
+  fax:    '📠',
+  email:  '✉️',
+  sms:    '💬',
+  voice:  '📞',
+  portal: '🌐',
+};
 
-function confidenceBg(score: number): string {
-  if (score >= 0.8) return '#d1fae5';
-  if (score >= 0.5) return '#fef3c7';
-  return '#fee2e2';
-}
+const CHANNEL_LABELS: Record<string, string> = {
+  fax:    'Fax',
+  email:  'Email',
+  sms:    'SMS',
+  voice:  'Voice',
+  portal: 'In-app',
+};
 
-function actorBadge(actor: string): { label: string; bg: string; color: string } {
-  if (actor.startsWith('agent:')) return { label: actor, bg: '#ede9fe', color: '#6d28d9' };
-  if (actor === 'human') return { label: 'human', bg: '#dbeafe', color: '#1d4ed8' };
-  return { label: actor, bg: '#f3f4f6', color: '#374151' };
+function confidenceColor(score: number) {
+  if (score >= 0.8) return 'var(--color-success)';
+  if (score >= 0.5) return 'var(--color-warning)';
+  return 'var(--color-error)';
 }
-
-function statusBadge(status: string): { bg: string; color: string } {
-  switch (status) {
-    case 'sent': return { bg: '#dbeafe', color: '#1d4ed8' };
-    case 'awaiting_response': return { bg: '#fef3c7', color: '#92400e' };
-    case 'responded': return { bg: '#d1fae5', color: '#065f46' };
-    case 'timed_out': return { bg: '#fee2e2', color: '#991b1b' };
-    case 'failed': return { bg: '#fee2e2', color: '#991b1b' };
-    default: return { bg: '#f3f4f6', color: '#374151' };
-  }
-}
-
-function channelIcon(channel: string): string {
-  switch (channel) {
-    case 'fax': return '⏡'; // fax symbol approximation
-    case 'email': return '✉️';
-    case 'sms': return '💬';
-    case 'voice': return '📞';
-    default: return '📬';
-  }
-}
-
-function channelLabel(channel: string): string {
-  switch (channel) {
-    case 'fax': return 'Fax 📠';
-    case 'email': return 'Email ✉️';
-    case 'sms': return 'SMS 💬';
-    case 'voice': return 'Voice 📞';
-    default: return channel;
-  }
+function confidenceBg(score: number) {
+  if (score >= 0.8) return 'var(--color-success-bg)';
+  if (score >= 0.5) return 'var(--color-warning-bg)';
+  return 'var(--color-error-bg)';
 }
 
 function fmtTime(ts: string): string {
-  try {
-    return new Date(ts).toLocaleString();
-  } catch {
-    return ts;
-  }
+  try { return new Date(ts).toLocaleString(); } catch { return ts; }
 }
 
 function countdown(ts: string | null): string | null {
@@ -85,10 +100,351 @@ function countdown(ts: string | null): string | null {
   return `${Math.ceil(s / 60)}m`;
 }
 
+function getAgentState(item: WorkItemDetail['item']): AgentState {
+  const raw = (item.agentState ?? item.agent_state ?? {}) as AgentState;
+  return raw;
+}
+
+function getSourceText(item: WorkItemDetail['item']): string | null {
+  return item.sourceText ?? item.source_text ?? null;
+}
+
 const QUEUE_KEYS = ['intake', 'referrals', 'roi_incoming', 'roi_outgoing', 'human_review'];
 
 // ---------------------------------------------------------------------------
-// Component
+// Chase stepper header
+// ---------------------------------------------------------------------------
+
+function ChaseStepperHeader({
+  agentState,
+  attempts,
+  itemStatus,
+}: {
+  agentState: AgentState;
+  attempts: AttemptWithDoc[];
+  itemStatus: string;
+}) {
+  const plan = agentState.chase_plan;
+  if (!plan || !plan.channels || plan.channels.length === 0) return null;
+
+  const isDone = itemStatus === 'done';
+  const isHumanReview = itemStatus === 'human_review' || false;
+  const attemptNo = agentState.attempt_no ?? attempts.length;
+
+  return (
+    <div className="card" style={{ marginBottom: '24px', padding: '16px 20px' }}>
+      <div className="section-label">Chase Plan — {plan.channels.length} channel{plan.channels.length !== 1 ? 's' : ''}, {plan.waitSeconds}s wait</div>
+      <div className="stepper">
+        {plan.channels.map((ch, i) => {
+          const chIdx = i + 1;
+          // Determine step state from attempts
+          const attForChannel = attempts.filter((a) => a.channel === ch);
+          const lastAtt = attForChannel[attForChannel.length - 1];
+
+          let stepClass = '';
+          let icon = CHANNEL_ICONS[ch] ?? '?';
+          let stateLabel = '';
+
+          if (lastAtt) {
+            if (lastAtt.status === 'responded') {
+              stepClass = 'done';
+              stateLabel = '✓';
+            } else if (lastAtt.status === 'timed_out' || lastAtt.status === 'failed') {
+              stepClass = 'failed';
+              stateLabel = '✗';
+            } else if (lastAtt.status === 'awaiting_response' || lastAtt.status === 'sent') {
+              stepClass = 'active';
+              stateLabel = '●';
+            }
+          } else if (isDone && chIdx <= attemptNo) {
+            stepClass = 'done';
+            stateLabel = '✓';
+          } else if ((isHumanReview) && chIdx <= attemptNo) {
+            stepClass = 'failed';
+            stateLabel = '✗';
+          }
+
+          return (
+            <span key={ch} style={{ display: 'inline-flex', alignItems: 'center' }}>
+              <span
+                className={`stepper-step ${stepClass}`}
+                title={`${CHANNEL_LABELS[ch] ?? ch}${stateLabel ? ' — ' + stateLabel : ''}`}
+              >
+                <span>{icon}</span>
+                <span>{CHANNEL_LABELS[ch] ?? ch}</span>
+                {stateLabel && <span>{stateLabel}</span>}
+              </span>
+              {i < plan.channels.length - 1 && (
+                <span className="stepper-arrow">→ {plan.waitSeconds}s →</span>
+              )}
+            </span>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Fax paper card (document viewer)
+// ---------------------------------------------------------------------------
+
+function DocumentExpander({ document, label }: { document: string; label?: string }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div style={{ marginTop: '8px' }}>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        style={{
+          background: 'none',
+          border: 'none',
+          color: 'var(--color-accent)',
+          cursor: 'pointer',
+          fontSize: '0.78rem',
+          fontWeight: 600,
+          padding: '2px 0',
+          display: 'inline-flex',
+          alignItems: 'center',
+          gap: '4px',
+        }}
+      >
+        {open ? '▾' : '▸'} {label ?? 'View document'}
+      </button>
+      {open && (
+        <div className="card-paper" style={{ marginTop: '8px', maxHeight: '340px', overflowY: 'auto', fontSize: '0.76rem' }}>
+          {document}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Attempt card
+// ---------------------------------------------------------------------------
+
+function AttemptCard({ att, index }: { att: AttemptWithDoc; index: number }) {
+  const sb = statusBadgeProps(att.status);
+  const cd = countdown(att.respond_after ?? (att as unknown as { respondAfter?: string }).respondAfter ?? null);
+  const doc = att.payload?.document;
+  const response = att.response;
+
+  const isPortalChannel = att.channel === 'portal';
+  const isVoiceNoAnswer = response?.outcome === 'no_answer';
+
+  return (
+    <div
+      style={{
+        background: 'var(--color-bg)',
+        border: `1px solid var(--color-border)`,
+        borderLeft: `3px solid ${sb.borderColor}`,
+        borderRadius: 'var(--radius)',
+        padding: '14px 16px',
+      }}
+    >
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
+        <span style={{ fontSize: '1.1rem' }}>{CHANNEL_ICONS[att.channel] ?? '📬'}</span>
+        <span style={{ fontSize: '0.88rem', fontWeight: 700 }}>
+          {CHANNEL_LABELS[att.channel] ?? att.channel}
+          {' '}— Attempt #{att.attempt_no ?? (index + 1)}
+        </span>
+        <span
+          className={`badge ${sb.badgeClass}`}
+        >
+          {att.status.replace(/_/g, ' ')}
+        </span>
+        {att.status === 'awaiting_response' && cd && (
+          <span style={{ fontSize: '0.74rem', color: 'var(--color-warning)', fontWeight: 600, marginLeft: 'auto' }}>
+            ⏱ response or timeout in ~{cd}
+          </span>
+        )}
+      </div>
+
+      {/* Subject */}
+      {!!att.payload?.subject && (
+        <div style={{ fontSize: '0.78rem', color: 'var(--color-ink-muted)', marginTop: '6px' }}>
+          Subject: {String(att.payload.subject)}
+        </div>
+      )}
+
+      {/* Document expander */}
+      {doc && typeof doc === 'string' && doc.trim() && (
+        <DocumentExpander document={doc} label={`View ${CHANNEL_LABELS[att.channel] ?? att.channel} document`} />
+      )}
+
+      {/* Response block */}
+      {response && Object.keys(response).length > 0 && (
+        <div
+          style={{
+            marginTop: '10px',
+            padding: '10px 12px',
+            background: isVoiceNoAnswer ? 'var(--color-warning-bg)' : 'var(--color-success-bg)',
+            border: `1px solid ${isVoiceNoAnswer ? '#fde68a' : '#bbf7d0'}`,
+            borderRadius: 'var(--radius-sm)',
+          }}
+        >
+          <div className="section-label" style={{ marginBottom: '6px' }}>
+            Response {isPortalChannel ? '(via portal)' : ''}
+          </div>
+
+          {/* Voice no-answer outcome */}
+          {isVoiceNoAnswer && (
+            <div style={{ fontSize: '0.80rem', color: 'var(--color-warning)', fontWeight: 600 }}>
+              No answer — {response.note ?? 'Call attempted; voicemail left.'}
+            </div>
+          )}
+
+          {/* Message */}
+          {!isVoiceNoAnswer && response.message && (
+            <div style={{ fontSize: '0.82rem', color: 'var(--color-ink)' }}>
+              {String(response.message)}
+            </div>
+          )}
+
+          {/* Response document (received records transmittal) */}
+          {response.document && typeof response.document === 'string' && (
+            <DocumentExpander
+              document={response.document}
+              label="View records transmittal"
+            />
+          )}
+
+          {/* Authorization note */}
+          {response.authorization && (
+            <div style={{ fontSize: '0.78rem', color: 'var(--color-success)', marginTop: '4px' }}>
+              {String(response.authorization)}
+            </div>
+          )}
+
+          {/* Received timestamp */}
+          {response.received_at && (
+            <div style={{ fontSize: '0.72rem', color: 'var(--color-ink-faint)', marginTop: '4px' }}>
+              Received: {fmtTime(String(response.received_at))}
+            </div>
+          )}
+
+          {/* Fallback: show summary or raw if nothing else matched */}
+          {!isVoiceNoAnswer && !response.message && !response.document && !response.authorization && (
+            <div style={{ fontSize: '0.78rem', color: 'var(--color-ink-muted)' }}>
+              {response.summary ? String(response.summary) : JSON.stringify(response)}
+            </div>
+          )}
+        </div>
+      )}
+
+      <div style={{ fontSize: '0.72rem', color: 'var(--color-ink-faint)', marginTop: '6px' }}>
+        {fmtTime(att.created_at)}
+      </div>
+    </div>
+  );
+}
+
+function statusBadgeProps(status: string): { badgeClass: string; borderColor: string } {
+  switch (status) {
+    case 'sent':             return { badgeClass: 'badge-info',    borderColor: 'var(--color-info)' };
+    case 'awaiting_response':return { badgeClass: 'badge-warning', borderColor: 'var(--color-warning)' };
+    case 'responded':        return { badgeClass: 'badge-success', borderColor: 'var(--color-success)' };
+    case 'timed_out':        return { badgeClass: 'badge-error',   borderColor: 'var(--color-error)' };
+    case 'failed':           return { badgeClass: 'badge-error',   borderColor: 'var(--color-error)' };
+    default:                 return { badgeClass: 'badge-neutral', borderColor: 'var(--color-border)' };
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Audit timeline
+// ---------------------------------------------------------------------------
+
+function AuditTimeline({ audit }: { audit: AuditLogEntry[] }) {
+  if (audit.length === 0) {
+    return (
+      <div style={{ color: 'var(--color-ink-faint)', fontSize: '0.82rem' }}>
+        No events yet.
+      </div>
+    );
+  }
+
+  return (
+    <div className="audit-rail" style={{ maxHeight: '380px', overflowY: 'auto' }}>
+      {[...audit].map((entry) => {
+        const isPortal = entry.actor.startsWith('portal:');
+        const isAgent = entry.actor.startsWith('agent:');
+        const isHuman = entry.actor === 'human';
+
+        let dotColor = 'var(--color-ink-faint)';
+        let badgeClass = 'badge-neutral';
+        let label = entry.actor;
+
+        if (isPortal) {
+          dotColor = 'var(--color-portal)';
+          badgeClass = 'badge-portal';
+          label = entry.actor;
+        } else if (isAgent) {
+          dotColor = 'var(--color-accent)';
+          badgeClass = 'badge-accent';
+          label = entry.actor.replace('agent:', '');
+        } else if (isHuman) {
+          dotColor = 'var(--color-success)';
+          badgeClass = 'badge-success';
+          label = 'Human';
+        }
+
+        const detail = entry.detail ?? {};
+
+        return (
+          <div key={entry.id} className="audit-entry">
+            <div className="audit-dot" style={{ color: dotColor }} />
+            <div className="audit-body">
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span className={`badge ${badgeClass}`} style={{ fontSize: '0.70rem' }}>
+                  {label}
+                </span>
+                <span style={{ fontSize: '0.82rem', fontWeight: 600 }}>{entry.action}</span>
+                <span style={{ fontSize: '0.74rem', color: 'var(--color-ink-faint)', marginLeft: 'auto', whiteSpace: 'nowrap' }}>
+                  {fmtTime(entry.created_at)}
+                </span>
+              </div>
+              {!!detail.rationale && (
+                <div style={{ fontSize: '0.76rem', color: 'var(--color-ink-muted)', marginTop: '3px', fontStyle: 'italic' }}>
+                  {String(detail.rationale)}
+                </div>
+              )}
+              {typeof detail.confidence === 'number' && (
+                <div style={{ fontSize: '0.74rem', marginTop: '2px', color: confidenceColor(detail.confidence as number), fontWeight: 700 }}>
+                  {((detail.confidence as number) * 100).toFixed(0)}% confidence
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Button helper
+// ---------------------------------------------------------------------------
+
+function btnStyle(bg: string, disabled: boolean): React.CSSProperties {
+  return {
+    padding: '8px 16px',
+    background: disabled ? 'var(--color-border)' : bg,
+    color: disabled ? 'var(--color-ink-faint)' : '#fff',
+    border: 'none',
+    borderRadius: 'var(--radius-sm)',
+    fontSize: '0.82rem',
+    fontWeight: 600,
+    cursor: disabled ? 'default' : 'pointer',
+    whiteSpace: 'nowrap',
+    transition: 'background var(--transition)',
+    opacity: disabled ? 0.6 : 1,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Main page component
 // ---------------------------------------------------------------------------
 
 export default function WorkItemDetailPage() {
@@ -99,26 +455,20 @@ export default function WorkItemDetailPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Action form state
   const [actionInFlight, setActionInFlight] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
   const [actionSuccess, setActionSuccess] = useState<string | null>(null);
 
-  // Escalate to human form
   const [escalateQuestion, setEscalateQuestion] = useState('');
   const [showEscalate, setShowEscalate] = useState(false);
-
-  // Advance stage form
   const [advanceQueue, setAdvanceQueue] = useState('referrals');
   const [showAdvance, setShowAdvance] = useState(false);
 
-  // Send channel form
   type SendChannel = 'fax' | 'email' | 'sms' | 'voice';
   const [sendChannel, setSendChannel] = useState<SendChannel | null>(null);
   const [sendSubject, setSendSubject] = useState('');
   const [sendBody, setSendBody] = useState('');
 
-  // Countdown timer for outbound attempts
   const [, setTick] = useState(0);
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -135,14 +485,12 @@ export default function WorkItemDetailPage() {
         return;
       }
       const body = (await res.json()) as Record<string, unknown>;
-      // Handle both wrapped and unwrapped shapes, and the API's actual key
-      // names (auditTrail/outboundAttempts) alongside the spec's (audit/attempts).
       const raw = (body['data'] ?? body) as Record<string, unknown>;
       const data: WorkItemDetail = {
         item: raw['item'] as WorkItemDetail['item'],
-        audit: (raw['audit'] ?? raw['auditTrail'] ?? []) as WorkItemDetail['audit'],
-        attempts: (raw['attempts'] ?? raw['outboundAttempts'] ?? []) as WorkItemDetail['attempts'],
-        patientCandidates: (raw['patientCandidates'] ?? []) as WorkItemDetail['patientCandidates'],
+        audit:             (raw['audit']            ?? raw['auditTrail']       ?? []) as AuditLogEntry[],
+        attempts:          (raw['attempts']         ?? raw['outboundAttempts'] ?? []) as OutboundAttempt[],
+        patientCandidates: (raw['patientCandidates'] ?? []) as Patient[],
       };
       setDetail(data);
       setError(null);
@@ -159,12 +507,9 @@ export default function WorkItemDetailPage() {
     return () => clearInterval(interval);
   }, [fetchDetail]);
 
-  // Countdown ticker for respond_after display
   useEffect(() => {
     tickRef.current = setInterval(() => setTick((t) => t + 1), 1000);
-    return () => {
-      if (tickRef.current) clearInterval(tickRef.current);
-    };
+    return () => { if (tickRef.current) clearInterval(tickRef.current); };
   }, []);
 
   // ---------------------------------------------------------------------------
@@ -181,7 +526,7 @@ export default function WorkItemDetailPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ tool, params }),
       });
-      const body = (await res.json()) as { error?: { message?: string } | string; status?: string; data?: unknown };
+      const body = (await res.json()) as { error?: { message?: string } | string; status?: string };
       if (!res.ok) {
         const msg = typeof body.error === 'object' && body.error !== null
           ? (body.error as { message?: string }).message ?? JSON.stringify(body.error)
@@ -199,20 +544,19 @@ export default function WorkItemDetailPage() {
   }
 
   // ---------------------------------------------------------------------------
-  // Loading / error states
+  // Loading / error
   // ---------------------------------------------------------------------------
 
   if (loading) {
     return (
-      <div style={{ padding: '48px 0', color: '#9ca3af', textAlign: 'center' }}>
+      <div style={{ padding: '64px 0', color: 'var(--color-ink-faint)', textAlign: 'center', fontSize: '0.88rem' }}>
         Loading work item…
       </div>
     );
   }
-
   if (error || !detail) {
     return (
-      <div style={{ padding: '48px 0', color: '#dc2626', textAlign: 'center' }}>
+      <div style={{ padding: '64px 0', color: 'var(--color-error)', textAlign: 'center' }}>
         {error ?? 'Work item not found'}
       </div>
     );
@@ -220,7 +564,11 @@ export default function WorkItemDetailPage() {
 
   const { item, audit, attempts, patientCandidates } = detail;
   const isHumanReview = item.queue_key === 'human_review';
+  const isOutbound = item.type === 'records_request_out';
   const confidence = item.confidence ?? {};
+  const agentState = getAgentState(item);
+  const sourceText = getSourceText(item);
+  const typedAttempts = attempts as AttemptWithDoc[];
 
   // ---------------------------------------------------------------------------
   // Render
@@ -230,91 +578,82 @@ export default function WorkItemDetailPage() {
     <div>
       {/* Header */}
       <div style={{ marginBottom: '24px' }}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginBottom: '6px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '8px' }}>
           <button
             onClick={() => router.back()}
             style={{
-              background: 'none',
-              border: 'none',
-              color: '#6b7280',
-              cursor: 'pointer',
-              fontSize: '0.85rem',
-              padding: 0,
+              background: 'none', border: 'none', color: 'var(--color-ink-muted)',
+              cursor: 'pointer', fontSize: '0.84rem', padding: 0, display: 'inline-flex', alignItems: 'center', gap: '4px',
             }}
           >
-            &larr; Back
+            ← Back
           </button>
-          <span style={{ color: '#d1d5db' }}>|</span>
-          <span style={{ fontSize: '0.82rem', color: '#9ca3af', fontFamily: 'monospace' }}>{item.id}</span>
+          <span style={{ color: 'var(--color-border-strong)' }}>|</span>
+          <code style={{ fontSize: '0.76rem', color: 'var(--color-ink-faint)', fontFamily: 'monospace', background: '#f1f3f6', padding: '2px 6px', borderRadius: 'var(--radius-sm)' }}>
+            {item.id}
+          </code>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <h1 style={{ fontSize: '1.5rem', fontWeight: 800, margin: 0, textTransform: 'capitalize' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flexWrap: 'wrap' }}>
+          <h1 style={{ fontSize: '1.5rem', fontWeight: 800, margin: 0, textTransform: 'capitalize', color: 'var(--color-ink)' }}>
             {item.type.replace(/_/g, ' ')}
           </h1>
-          <span style={{
-            padding: '3px 10px',
-            borderRadius: '99px',
-            fontSize: '0.75rem',
-            fontWeight: 600,
-            background: item.status === 'done' ? '#d1fae5' : item.status === 'error' ? '#fee2e2' : '#fef3c7',
-            color: item.status === 'done' ? '#065f46' : item.status === 'error' ? '#991b1b' : '#92400e',
-          }}>
+          <span
+            className={`badge ${
+              item.status === 'done'  ? 'badge-success' :
+              item.status === 'error' ? 'badge-error' :
+              item.status === 'waiting' ? 'badge-accent' :
+              'badge-warning'
+            }`}
+            style={{ padding: '4px 12px', fontSize: '0.80rem' }}
+          >
             {item.status}
           </span>
-          <span style={{ fontSize: '0.82rem', color: '#6b7280' }}>{item.queue_key}</span>
+          <span style={{ fontSize: '0.80rem', color: 'var(--color-ink-faint)' }}>{item.queue_key}</span>
         </div>
       </div>
 
+      {/* Chase stepper — only for outbound items */}
+      {isOutbound && (
+        <ChaseStepperHeader
+          agentState={agentState}
+          attempts={typedAttempts}
+          itemStatus={item.status}
+        />
+      )}
+
       {/* Human Review block */}
       {isHumanReview && (
-        <div style={{
-          background: '#fff7ed',
-          border: '2px solid #fb923c',
-          borderRadius: '10px',
-          padding: '20px 24px',
-          marginBottom: '24px',
-        }}>
+        <div
+          style={{
+            background: '#fff7ed',
+            border: '2px solid #fb923c',
+            borderRadius: 'var(--radius)',
+            padding: '20px 24px',
+            marginBottom: '24px',
+          }}
+        >
           <div style={{ fontWeight: 700, fontSize: '1rem', color: '#9a3412', marginBottom: '8px' }}>
             Human Review Required
           </div>
           {item.review_reason && (
-            <div style={{ fontSize: '0.95rem', marginBottom: '16px', color: '#431407' }}>
+            <div style={{ fontSize: '0.92rem', marginBottom: '16px', color: '#431407', lineHeight: 1.5 }}>
               {item.review_reason}
             </div>
           )}
 
-          {/* Patient candidates */}
           {patientCandidates && patientCandidates.length > 0 && (
             <div style={{ marginBottom: '16px' }}>
-              <div style={{ fontSize: '0.82rem', fontWeight: 600, color: '#7c3aed', marginBottom: '8px' }}>
-                Patient Candidates
-              </div>
+              <div className="section-label">Patient Candidates</div>
               <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
                 {patientCandidates.map((p) => (
-                  <div key={p.id} style={{
-                    background: '#fff',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: '8px',
-                    padding: '12px 16px',
-                    minWidth: '200px',
-                  }}>
+                  <div key={p.id} className="card" style={{ minWidth: '180px', padding: '12px 16px' }}>
                     <div style={{ fontWeight: 700 }}>{p.first_name} {p.last_name}</div>
-                    <div style={{ fontSize: '0.82rem', color: '#6b7280' }}>DOB: {p.dob}</div>
-                    <div style={{ fontSize: '0.82rem', color: '#6b7280' }}>MRN: {p.mrn}</div>
+                    <div style={{ fontSize: '0.80rem', color: 'var(--color-ink-muted)' }}>DOB: {p.dob}</div>
+                    <div style={{ fontSize: '0.80rem', color: 'var(--color-ink-muted)' }}>MRN: {p.mrn}</div>
                     <button
                       onClick={() => void runAction('resolve_review', { patientId: p.id })}
                       disabled={actionInFlight}
-                      style={{
-                        marginTop: '10px',
-                        padding: '6px 14px',
-                        background: actionInFlight ? '#a5b4fc' : '#4f46e5',
-                        color: '#fff',
-                        border: 'none',
-                        borderRadius: '6px',
-                        fontSize: '0.82rem',
-                        fontWeight: 600,
-                        cursor: actionInFlight ? 'default' : 'pointer',
-                      }}
+                      style={{ ...btnStyle('var(--color-accent)', actionInFlight), marginTop: '10px' }}
                     >
                       This one
                     </button>
@@ -324,23 +663,14 @@ export default function WorkItemDetailPage() {
             </div>
           )}
 
-          {/* Free-form resolution */}
           <div style={{ display: 'flex', gap: '10px', flexWrap: 'wrap' }}>
-            <button
-              onClick={() => void runAction('mark_complete', {})}
-              disabled={actionInFlight}
-              style={btnStyle('#059669', actionInFlight)}
-            >
+            <button onClick={() => void runAction('mark_complete', {})} disabled={actionInFlight} style={btnStyle('var(--color-success)', actionInFlight)}>
               Mark complete
             </button>
             <button
-              onClick={() => {
-                setShowEscalate(true);
-                setShowAdvance(false);
-                setSendChannel(null);
-              }}
+              onClick={() => { setShowEscalate(true); setShowAdvance(false); setSendChannel(null); }}
               disabled={actionInFlight}
-              style={btnStyle('#d97706', actionInFlight)}
+              style={btnStyle('var(--color-warning)', actionInFlight)}
             >
               Escalate stays human
             </button>
@@ -350,46 +680,31 @@ export default function WorkItemDetailPage() {
 
       {/* Two-column layout */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '24px', alignItems: 'start' }}>
-        {/* LEFT COLUMN */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
 
-          {/* Source document fax rendering */}
-          {item.source_text && (
-            <section style={{
-              background: '#fffef5',
-              border: '1px solid #d4c89a',
-              borderRadius: '8px',
-              padding: '20px',
-              boxShadow: '2px 2px 8px rgba(0,0,0,0.06)',
-            }}>
-              <div style={{ fontSize: '0.75rem', fontWeight: 700, color: '#92400e', marginBottom: '10px', letterSpacing: '0.05em' }}>
-                SOURCE DOCUMENT (FAX)
+        {/* LEFT */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
+
+          {/* Source document — fax-paper treatment */}
+          {sourceText && (
+            <section>
+              <div className="section-label">Source Document (Fax)</div>
+              <div className="card-paper">
+                {sourceText}
               </div>
-              <pre style={{
-                fontFamily: '"Courier New", Courier, monospace',
-                fontSize: '0.78rem',
-                whiteSpace: 'pre-wrap',
-                wordBreak: 'break-word',
-                margin: 0,
-                color: '#1c1917',
-                lineHeight: 1.6,
-              }}>
-                {item.source_text}
-              </pre>
             </section>
           )}
 
           {/* Extracted data */}
           {Object.keys(item.extracted_data ?? {}).length > 0 && (
-            <section style={cardStyle}>
-              <div style={sectionLabel}>Extracted Data</div>
-              <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '4px 16px' }}>
+            <section className="card">
+              <div className="section-label">Extracted Data</div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '3px 16px' }}>
                 {Object.entries(item.extracted_data).map(([k, v]) => (
                   <>
-                    <span key={`k-${k}`} style={{ fontSize: '0.78rem', color: '#6b7280', fontWeight: 600, padding: '3px 0', textTransform: 'capitalize', whiteSpace: 'nowrap' }}>
+                    <span key={`k-${k}`} style={{ fontSize: '0.77rem', color: 'var(--color-ink-muted)', fontWeight: 600, padding: '3px 0', textTransform: 'capitalize', whiteSpace: 'nowrap' }}>
                       {k.replace(/_/g, ' ')}
                     </span>
-                    <span key={`v-${k}`} style={{ fontSize: '0.82rem', color: '#111827', padding: '3px 0' }}>
+                    <span key={`v-${k}`} style={{ fontSize: '0.82rem', color: 'var(--color-ink)', padding: '3px 0' }}>
                       {String(v)}
                     </span>
                   </>
@@ -400,19 +715,22 @@ export default function WorkItemDetailPage() {
 
           {/* Confidence chips */}
           {Object.keys(confidence).length > 0 && (
-            <section style={cardStyle}>
-              <div style={sectionLabel}>Confidence Scores</div>
+            <section className="card">
+              <div className="section-label">Confidence Scores</div>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px' }}>
                 {Object.entries(confidence).map(([step, score]) => (
-                  <span key={step} style={{
-                    padding: '4px 12px',
-                    borderRadius: '99px',
-                    fontSize: '0.78rem',
-                    fontWeight: 700,
-                    background: confidenceBg(score),
-                    color: confidenceColor(score),
-                    border: `1px solid ${confidenceColor(score)}40`,
-                  }}>
+                  <span
+                    key={step}
+                    style={{
+                      padding: '4px 12px',
+                      borderRadius: '99px',
+                      fontSize: '0.77rem',
+                      fontWeight: 700,
+                      background: confidenceBg(score),
+                      color: confidenceColor(score),
+                      border: `1px solid ${confidenceColor(score)}40`,
+                    }}
+                  >
                     {step}: {(score * 100).toFixed(0)}%
                   </span>
                 ))}
@@ -420,35 +738,39 @@ export default function WorkItemDetailPage() {
             </section>
           )}
 
-          {/* Matched patient */}
-          <section style={cardStyle}>
-            <div style={sectionLabel}>Patient</div>
+          {/* Patient */}
+          <section className="card">
+            <div className="section-label">Patient</div>
             {item.patient ? (
               <div>
-                <div style={{ fontWeight: 700 }}>{item.patient.first_name} {item.patient.last_name}</div>
-                <div style={{ fontSize: '0.82rem', color: '#6b7280', marginTop: '2px' }}>
+                <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>
+                  {item.patient.first_name} {item.patient.last_name}
+                </div>
+                <div style={{ fontSize: '0.82rem', color: 'var(--color-ink-muted)', marginTop: '2px' }}>
                   DOB: {item.patient.dob} &bull; MRN: {item.patient.mrn}
                 </div>
               </div>
             ) : (
-              <div style={{ color: '#9ca3af', fontSize: '0.82rem' }}>Unmatched</div>
+              <div style={{ color: 'var(--color-ink-faint)', fontSize: '0.84rem' }}>Unmatched</div>
             )}
           </section>
 
-          {/* Org */}
+          {/* Organization */}
           {item.org && (
-            <section style={cardStyle}>
-              <div style={sectionLabel}>Organization</div>
-              <div style={{ fontWeight: 700 }}>{item.org.name}</div>
+            <section className="card">
+              <div className="section-label">Organization</div>
+              <div style={{ fontWeight: 700, fontSize: '0.95rem' }}>{item.org.name}</div>
               {item.org.contact && (
-                <div style={{ fontSize: '0.82rem', color: '#6b7280', marginTop: '4px' }}>
-                  {item.org.contact.fax && <div>Fax: {item.org.contact.fax}</div>}
-                  {item.org.contact.email && <div>Email: {item.org.contact.email}</div>}
-                  {item.org.contact.phone && <div>Phone: {item.org.contact.phone}</div>}
+                <div style={{ fontSize: '0.82rem', color: 'var(--color-ink-muted)', marginTop: '6px', display: 'flex', flexDirection: 'column', gap: '3px' }}>
+                  {item.org.contact.fax   && <span>📠 {item.org.contact.fax}</span>}
+                  {item.org.contact.email && <span>✉️ {item.org.contact.email}</span>}
+                  {item.org.contact.phone && <span>📞 {item.org.contact.phone}</span>}
                   {item.org.contact.preferred_channel && (
-                    <div style={{ marginTop: '4px', color: '#4b5563' }}>
-                      Preferred: {item.org.contact.preferred_channel}
-                    </div>
+                    <span style={{ marginTop: '4px' }}>
+                      <span className={`badge ${item.org.contact.preferred_channel === 'portal' ? 'badge-portal' : 'badge-neutral'}`}>
+                        {item.org.contact.preferred_channel === 'portal' ? '🌐 On network' : `Preferred: ${item.org.contact.preferred_channel}`}
+                      </span>
+                    </span>
                   )}
                 </div>
               )}
@@ -456,221 +778,105 @@ export default function WorkItemDetailPage() {
           )}
         </div>
 
-        {/* RIGHT COLUMN */}
-        <div style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+        {/* RIGHT */}
+        <div style={{ display: 'flex', flexDirection: 'column', gap: '18px' }}>
 
           {/* Audit timeline */}
-          <section style={cardStyle}>
-            <div style={sectionLabel}>Audit Timeline</div>
-            {audit.length === 0 ? (
-              <div style={{ color: '#9ca3af', fontSize: '0.82rem' }}>No events yet.</div>
-            ) : (
-              <div style={{ maxHeight: '340px', overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-                {[...audit].map((entry) => {
-                  const badge = actorBadge(entry.actor);
-                  const detail = entry.detail ?? {};
-                  return (
-                    <div key={entry.id} style={{
-                      borderLeft: `3px solid ${badge.color}`,
-                      paddingLeft: '12px',
-                      paddingTop: '2px',
-                      paddingBottom: '2px',
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
-                        <span style={{
-                          padding: '2px 8px',
-                          borderRadius: '99px',
-                          fontSize: '0.72rem',
-                          fontWeight: 700,
-                          background: badge.bg,
-                          color: badge.color,
-                        }}>
-                          {badge.label}
-                        </span>
-                        <span style={{ fontSize: '0.82rem', fontWeight: 600 }}>{entry.action}</span>
-                        <span style={{ fontSize: '0.75rem', color: '#9ca3af', marginLeft: 'auto' }}>
-                          {fmtTime(entry.created_at)}
-                        </span>
-                      </div>
-                      {!!detail.rationale && (
-                        <div style={{ fontSize: '0.78rem', color: '#4b5563', marginTop: '4px', fontStyle: 'italic' }}>
-                          {String(detail.rationale)}
-                        </div>
-                      )}
-                      {typeof detail.confidence === 'number' && (
-                        <div style={{ fontSize: '0.75rem', marginTop: '2px' }}>
-                          <span style={{
-                            color: confidenceColor(detail.confidence as number),
-                            fontWeight: 700,
-                          }}>
-                            {((detail.confidence as number) * 100).toFixed(0)}% confidence
-                          </span>
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-              </div>
-            )}
+          <section className="card">
+            <div className="section-label">Audit Timeline</div>
+            <AuditTimeline audit={audit} />
           </section>
 
           {/* Outbound attempts */}
-          {attempts.length > 0 && (
-            <section style={cardStyle}>
-              <div style={sectionLabel}>Outbound Attempts</div>
+          {typedAttempts.length > 0 ? (
+            <section className="card">
+              <div className="section-label">
+                Outbound Attempts ({typedAttempts.length})
+              </div>
               <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
-                {attempts.map((att) => {
-                  const sb = statusBadge(att.status);
-                  const cd = countdown(att.respond_after);
-                  return (
-                    <div key={att.id} style={{
-                      background: '#f9fafb',
-                      border: '1px solid #e5e7eb',
-                      borderRadius: '8px',
-                      padding: '12px 16px',
-                    }}>
-                      <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
-                        <span style={{ fontSize: '1.1rem' }}>{channelIcon(att.channel)}</span>
-                        <span style={{ fontSize: '0.82rem', fontWeight: 700 }}>
-                          {channelLabel(att.channel)} — Attempt #{att.attempt_no}
-                        </span>
-                        <span style={{
-                          padding: '2px 8px',
-                          borderRadius: '99px',
-                          fontSize: '0.72rem',
-                          fontWeight: 700,
-                          background: sb.bg,
-                          color: sb.color,
-                        }}>
-                          {att.status.replace(/_/g, ' ')}
-                        </span>
-                      </div>
-                      {!!(att.payload && att.payload.subject) && (
-                        <div style={{ fontSize: '0.78rem', color: '#4b5563', marginTop: '6px' }}>
-                          Subject: {String(att.payload.subject)}
-                        </div>
-                      )}
-                      {att.status === 'awaiting_response' && cd && (
-                        <div style={{ fontSize: '0.75rem', color: '#d97706', marginTop: '4px' }}>
-                          Response expected in {cd}
-                        </div>
-                      )}
-                      {att.response && Object.keys(att.response).length > 0 && (
-                        <div style={{
-                          marginTop: '8px',
-                          padding: '8px 10px',
-                          background: '#f0fdf4',
-                          border: '1px solid #bbf7d0',
-                          borderRadius: '6px',
-                          fontSize: '0.78rem',
-                          color: '#065f46',
-                        }}>
-                          Response: {att.response.summary
-                            ? String(att.response.summary)
-                            : JSON.stringify(att.response)}
-                        </div>
-                      )}
-                      <div style={{ fontSize: '0.72rem', color: '#9ca3af', marginTop: '4px' }}>
-                        {fmtTime(att.created_at)}
-                      </div>
-                    </div>
-                  );
-                })}
+                {typedAttempts.map((att, i) => (
+                  <AttemptCard key={att.id} att={att} index={i} />
+                ))}
               </div>
             </section>
-          )}
+          ) : isOutbound ? (
+            <section className="card" style={{ textAlign: 'center', padding: '32px 20px' }}>
+              <div style={{ fontSize: '1.6rem', marginBottom: '8px' }}>📤</div>
+              <div className="section-label" style={{ marginBottom: '4px' }}>No outbound attempts yet</div>
+              <div style={{ fontSize: '0.82rem', color: 'var(--color-ink-faint)' }}>
+                The agent sends on the next tick.
+              </div>
+            </section>
+          ) : null}
         </div>
       </div>
 
       {/* Manual Actions bar */}
-      <section style={{
-        ...cardStyle,
-        marginTop: '28px',
-        background: '#f8fafc',
-        border: '1px solid #cbd5e1',
-      }}>
-        <div style={sectionLabel}>Manual Actions</div>
+      <section
+        className="card"
+        style={{ marginTop: '28px', background: '#f8fafc', border: '1px solid var(--color-border-strong)' }}
+      >
+        <div className="section-label">Manual Actions</div>
 
         {actionError && (
-          <div style={{
-            background: '#fee2e2',
-            border: '1px solid #fca5a5',
-            borderRadius: '6px',
-            padding: '8px 14px',
-            color: '#991b1b',
-            fontSize: '0.82rem',
-            marginBottom: '12px',
-          }}>
+          <div
+            style={{
+              background: 'var(--color-error-bg)',
+              border: '1px solid #fca5a5',
+              borderRadius: 'var(--radius-sm)',
+              padding: '8px 14px',
+              color: 'var(--color-error)',
+              fontSize: '0.82rem',
+              marginBottom: '12px',
+            }}
+          >
             {actionError}
           </div>
         )}
         {actionSuccess && (
-          <div style={{
-            background: '#d1fae5',
-            border: '1px solid #6ee7b7',
-            borderRadius: '6px',
-            padding: '8px 14px',
-            color: '#065f46',
-            fontSize: '0.82rem',
-            marginBottom: '12px',
-          }}>
+          <div
+            style={{
+              background: 'var(--color-success-bg)',
+              border: '1px solid #6ee7b7',
+              borderRadius: 'var(--radius-sm)',
+              padding: '8px 14px',
+              color: 'var(--color-success)',
+              fontSize: '0.82rem',
+              marginBottom: '12px',
+            }}
+          >
             {actionSuccess}
           </div>
         )}
 
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '10px', marginBottom: '16px' }}>
-          {/* Advance stage */}
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px', marginBottom: '14px' }}>
           <button
-            onClick={() => {
-              setShowAdvance(!showAdvance);
-              setShowEscalate(false);
-              setSendChannel(null);
-            }}
+            onClick={() => { setShowAdvance(!showAdvance); setShowEscalate(false); setSendChannel(null); }}
             disabled={actionInFlight}
             style={btnStyle('#1e3a5f', actionInFlight)}
           >
             Advance stage
           </button>
-
-          {/* Send channels */}
           {(['fax', 'email', 'sms', 'voice'] as const).map((ch) => (
             <button
               key={ch}
-              onClick={() => {
-                setSendChannel(sendChannel === ch ? null : ch);
-                setShowAdvance(false);
-                setShowEscalate(false);
-              }}
+              onClick={() => { setSendChannel(sendChannel === ch ? null : ch); setShowAdvance(false); setShowEscalate(false); }}
               disabled={actionInFlight}
               style={btnStyle('#0891b2', actionInFlight)}
             >
-              {channelLabel(ch)}
+              {CHANNEL_ICONS[ch]} {ch}
             </button>
           ))}
-
-          {/* Other quick actions */}
-          <button
-            onClick={() => void runAction('request_more_info', {})}
-            disabled={actionInFlight}
-            style={btnStyle('#7c3aed', actionInFlight)}
-          >
+          <button onClick={() => void runAction('request_more_info', {})} disabled={actionInFlight} style={btnStyle('#7c3aed', actionInFlight)}>
             Request more info
           </button>
-          <button
-            onClick={() => void runAction('mark_complete', {})}
-            disabled={actionInFlight}
-            style={btnStyle('#059669', actionInFlight)}
-          >
+          <button onClick={() => void runAction('mark_complete', {})} disabled={actionInFlight} style={btnStyle('var(--color-success)', actionInFlight)}>
             Mark complete
           </button>
           <button
-            onClick={() => {
-              setShowEscalate(!showEscalate);
-              setShowAdvance(false);
-              setSendChannel(null);
-            }}
+            onClick={() => { setShowEscalate(!showEscalate); setShowAdvance(false); setSendChannel(null); }}
             disabled={actionInFlight}
-            style={btnStyle('#dc2626', actionInFlight)}
+            style={btnStyle('var(--color-error)', actionInFlight)}
           >
             Escalate to human
           </button>
@@ -679,20 +885,11 @@ export default function WorkItemDetailPage() {
         {/* Advance stage form */}
         {showAdvance && (
           <div style={inlineFormStyle}>
-            <select
-              value={advanceQueue}
-              onChange={(e) => setAdvanceQueue(e.target.value)}
-              style={selectStyle}
-            >
-              {QUEUE_KEYS.map((k) => (
-                <option key={k} value={k}>{k}</option>
-              ))}
+            <select value={advanceQueue} onChange={(e) => setAdvanceQueue(e.target.value)} style={selectStyle}>
+              {QUEUE_KEYS.map((k) => <option key={k} value={k}>{k}</option>)}
             </select>
             <button
-              onClick={() => {
-                void runAction('advance_stage', { queue_key: advanceQueue });
-                setShowAdvance(false);
-              }}
+              onClick={() => { void runAction('advance_stage', { queue_key: advanceQueue }); setShowAdvance(false); }}
               disabled={actionInFlight}
               style={btnStyle('#1e3a5f', actionInFlight)}
             >
@@ -719,14 +916,8 @@ export default function WorkItemDetailPage() {
             />
             <button
               onClick={() => {
-                void runAction(`send_${sendChannel}`, {
-                  subject: sendSubject,
-                  body: sendBody,
-                  org_id: item.org_id ?? undefined,
-                });
-                setSendChannel(null);
-                setSendSubject('');
-                setSendBody('');
+                void runAction(`send_${sendChannel}`, { subject: sendSubject, body: sendBody, org_id: item.org_id ?? undefined });
+                setSendChannel(null); setSendSubject(''); setSendBody('');
               }}
               disabled={actionInFlight || !sendSubject}
               style={btnStyle('#0891b2', actionInFlight || !sendSubject)}
@@ -736,7 +927,7 @@ export default function WorkItemDetailPage() {
           </div>
         )}
 
-        {/* Escalate to human form */}
+        {/* Escalate form */}
         {showEscalate && (
           <div style={inlineFormStyle}>
             <input
@@ -746,13 +937,9 @@ export default function WorkItemDetailPage() {
               style={inputStyle}
             />
             <button
-              onClick={() => {
-                void runAction('escalate_to_human', { question: escalateQuestion });
-                setShowEscalate(false);
-                setEscalateQuestion('');
-              }}
+              onClick={() => { void runAction('escalate_to_human', { question: escalateQuestion }); setShowEscalate(false); setEscalateQuestion(''); }}
               disabled={actionInFlight || !escalateQuestion}
-              style={btnStyle('#dc2626', actionInFlight || !escalateQuestion)}
+              style={btnStyle('var(--color-error)', actionInFlight || !escalateQuestion)}
             >
               Escalate
             </button>
@@ -767,60 +954,31 @@ export default function WorkItemDetailPage() {
 // Style helpers
 // ---------------------------------------------------------------------------
 
-function btnStyle(bg: string, disabled: boolean): React.CSSProperties {
-  return {
-    padding: '8px 16px',
-    background: disabled ? '#d1d5db' : bg,
-    color: disabled ? '#9ca3af' : '#fff',
-    border: 'none',
-    borderRadius: '6px',
-    fontSize: '0.82rem',
-    fontWeight: 600,
-    cursor: disabled ? 'default' : 'pointer',
-    whiteSpace: 'nowrap',
-  };
-}
-
-const cardStyle: React.CSSProperties = {
-  background: '#fff',
-  border: '1px solid #e5e7eb',
-  borderRadius: '10px',
-  padding: '18px 20px',
-  boxShadow: '0 1px 3px rgba(0,0,0,0.05)',
-};
-
-const sectionLabel: React.CSSProperties = {
-  fontSize: '0.72rem',
-  fontWeight: 700,
-  letterSpacing: '0.06em',
-  textTransform: 'uppercase',
-  color: '#9ca3af',
-  marginBottom: '12px',
-};
-
 const inlineFormStyle: React.CSSProperties = {
   display: 'flex',
   flexDirection: 'column',
   gap: '8px',
   padding: '14px',
-  background: '#fff',
-  border: '1px solid #e5e7eb',
-  borderRadius: '8px',
+  background: 'var(--color-surface)',
+  border: '1px solid var(--color-border)',
+  borderRadius: 'var(--radius)',
   maxWidth: '440px',
 };
 
 const inputStyle: React.CSSProperties = {
   padding: '8px 10px',
-  border: '1px solid #d1d5db',
-  borderRadius: '6px',
-  fontSize: '0.85rem',
+  border: '1px solid var(--color-border-strong)',
+  borderRadius: 'var(--radius-sm)',
+  fontSize: '0.84rem',
   fontFamily: 'inherit',
+  width: '100%',
 };
 
 const selectStyle: React.CSSProperties = {
   padding: '8px 10px',
-  border: '1px solid #d1d5db',
-  borderRadius: '6px',
-  fontSize: '0.85rem',
-  background: '#fff',
+  border: '1px solid var(--color-border-strong)',
+  borderRadius: 'var(--radius-sm)',
+  fontSize: '0.84rem',
+  background: 'var(--color-surface)',
+  width: '100%',
 };

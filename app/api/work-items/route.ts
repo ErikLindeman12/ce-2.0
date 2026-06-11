@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { listWorkItems } from '@/lib/workItems';
+import { toWorkItemSummary } from '@/lib/types';
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
@@ -7,7 +8,7 @@ export async function GET(req: NextRequest) {
 
   try {
     const items = await listWorkItems(queue);
-    return NextResponse.json(items);
+    return NextResponse.json({ data: items.map(toWorkItemSummary) });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error('[work-items.list_failed]', msg);

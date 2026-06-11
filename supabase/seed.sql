@@ -162,3 +162,24 @@ ON CONFLICT (name) DO UPDATE
       tools                = EXCLUDED.tools,
       confidence_threshold = EXCLUDED.confidence_threshold,
       model                = EXCLUDED.model;
+
+-- =============================================================================
+-- W1 outbound-engine seed additions (idempotent jsonb UPDATEs)
+-- =============================================================================
+
+-- org_cleveland → preferred_channel='portal' (on-network; keep other contact fields)
+UPDATE organizations
+  SET contact = contact || '{"preferred_channel":"portal"}'::jsonb
+  WHERE id = 'org_cleveland';
+
+-- org_ucsf → keep simulation='no_response' (already set above; this is a no-op guard)
+UPDATE organizations
+  SET contact = contact || '{"simulation":"no_response"}'::jsonb
+  WHERE id = 'org_ucsf'
+    AND NOT (contact ? 'simulation');
+
+-- org_mgh → fax+phone ONLY (no email) so its channel plan visibly skips email.
+-- Remove email key; keep fax, phone, preferred_channel=fax.
+UPDATE organizations
+  SET contact = (contact - 'email') || '{"preferred_channel":"fax"}'::jsonb
+  WHERE id = 'org_mgh';

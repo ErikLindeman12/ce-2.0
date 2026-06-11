@@ -5,67 +5,179 @@ import { TimeAgo } from '@/app/components/TimeAgo';
 import type { WorkItem } from '@/lib/types';
 
 // ---------------------------------------------------------------------------
-// Small helpers
+// Types
 // ---------------------------------------------------------------------------
 
-function minConfidence(confidence: Record<string, number>): number | null {
-  const vals = Object.values(confidence);
-  if (vals.length === 0) return null;
-  return Math.min(...vals);
+type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal';
+
+interface ChasePlan {
+  channels: OutboundChannel[];
+  waitSeconds: number;
 }
 
-function ConfidenceBadge({ confidence }: { confidence: Record<string, number> }) {
-  const score = minConfidence(confidence);
-  if (score === null) return <span style={{ color: '#9ca3af' }}>—</span>;
+interface AgentState {
+  chase_plan?: ChasePlan;
+  attempt_no?: number;
+  last_channel?: OutboundChannel;
+  kind?: string;
+}
 
-  let bg = '#d1fae5';
-  let fg = '#065f46';
-  if (score < 0.5) { bg = '#fee2e2'; fg = '#991b1b'; }
-  else if (score < 0.8) { bg = '#fef3c7'; fg = '#92400e'; }
+// WorkItem already includes agent_state; alias with a typed cast helper
+type WorkItemWithAgentState = WorkItem;
+
+// ---------------------------------------------------------------------------
+// Channel icons + labels
+// ---------------------------------------------------------------------------
+
+const CHANNEL_ICONS: Record<string, string> = {
+  fax:    '📠',
+  email:  '✉️',
+  sms:    '💬',
+  voice:  '📞',
+  portal: '🌐',
+};
+
+const CHANNEL_LABELS: Record<string, string> = {
+  fax:    'Fax',
+  email:  'Email',
+  sms:    'SMS',
+  voice:  'Voice',
+  portal: 'Portal',
+};
+
+// ---------------------------------------------------------------------------
+// Chase Progress component
+// ---------------------------------------------------------------------------
+
+function ChaseProgress({ item }: { item: WorkItemWithAgentState }) {
+  const agentState = (item.agent_state ?? {}) as AgentState;
+  const plan = agentState.chase_plan;
+
+  // Only render for roi_outgoing items that have a chase_plan
+  if (!plan || !plan.channels || plan.channels.length === 0) {
+    return <span style={{ color: 'var(--color-ink-faint)' }}>—</span>;
+  }
+
+  const channels = plan.channels;
+  const attemptNo = agentState.attempt_no ?? 0;
+  const lastChannel = agentState.last_channel;
+
+  // Derive per-channel state
+  // done = all channels tried + item is done
+  // human_review = all tried + escalated
+  const isDone = item.status === 'done';
+  const isHumanReview = item.queue_key === 'human_review';
 
   return (
-    <span
-      style={{
-        display: 'inline-block',
-        padding: '2px 8px',
-        borderRadius: '4px',
-        background: bg,
-        color: fg,
-        fontSize: '0.75rem',
-        fontWeight: 700,
-      }}
-    >
-      {(score * 100).toFixed(0)}%
-    </span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+      {/* Icon strip */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: '4px', flexWrap: 'wrap' }}>
+        {channels.map((ch, i) => {
+          const chIdx = i + 1; // 1-based
+          let state: 'done' | 'failed' | 'active' | 'pending' = 'pending';
+
+          if (isDone || isHumanReview) {
+            // All channels that were tried are marked as failed for human_review, done for done
+            if (chIdx <= attemptNo) {
+              state = isDone ? 'done' : 'failed';
+            }
+          } else if (chIdx < attemptNo) {
+            state = 'failed'; // previous attempts timed out / failed
+          } else if (chIdx === attemptNo || (lastChannel === ch && item.status === 'waiting')) {
+            state = 'active';
+          }
+
+          let color = 'var(--color-ink-faint)';
+          let symbol = '○';
+          if (state === 'done')    { color = 'var(--color-success)'; symbol = '✓'; }
+          if (state === 'failed')  { color = 'var(--color-error)';   symbol = '✗'; }
+          if (state === 'active')  { color = 'var(--color-warning)'; symbol = '●'; }
+
+          return (
+            <span
+              key={ch}
+              title={`${chIdx}. ${CHANNEL_LABELS[ch] ?? ch} — ${state}`}
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '2px',
+                fontSize: '0.78rem',
+                color,
+                fontWeight: state !== 'pending' ? 700 : 400,
+              }}
+              className={state === 'active' ? 'chase-pulse' : ''}
+            >
+              <span>{CHANNEL_ICONS[ch] ?? '?'}</span>
+              <span style={{ fontSize: '0.68rem' }}>{symbol}</span>
+              {i < channels.length - 1 && (
+                <span style={{ color: 'var(--color-border-strong)', margin: '0 2px' }}>·</span>
+              )}
+            </span>
+          );
+        })}
+      </div>
+
+      {/* Attempt counter */}
+      {attemptNo > 0 && (
+        <div style={{ fontSize: '0.72rem', color: 'var(--color-ink-faint)' }}>
+          attempt {attemptNo}/{channels.length}
+        </div>
+      )}
+    </div>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Confidence meter bar
+// ---------------------------------------------------------------------------
+
+function ConfidenceMeter({ confidence }: { confidence: Record<string, number> }) {
+  const vals = Object.values(confidence);
+  if (vals.length === 0) return <span style={{ color: 'var(--color-ink-faint)' }}>—</span>;
+  const score = Math.min(...vals);
+
+  let fillColor = 'var(--color-success)';
+  if (score < 0.5) fillColor = 'var(--color-error)';
+  else if (score < 0.8) fillColor = 'var(--color-warning)';
+
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+      <div className="meter-bar">
+        <div
+          className="meter-bar-fill"
+          style={{ width: `${Math.round(score * 100)}%`, background: fillColor }}
+        />
+      </div>
+      <span style={{ fontSize: '0.74rem', fontWeight: 700, color: fillColor }}>
+        {Math.round(score * 100)}%
+      </span>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Status badge
+// ---------------------------------------------------------------------------
 
 function StatusBadge({ status }: { status: string }) {
-  const map: Record<string, { bg: string; fg: string }> = {
-    open:        { bg: '#dbeafe', fg: '#1d4ed8' },
-    in_progress: { bg: '#fef9c3', fg: '#854d0e' },
-    waiting:     { bg: '#e0e7ff', fg: '#3730a3' },
-    done:        { bg: '#d1fae5', fg: '#065f46' },
-    error:       { bg: '#fee2e2', fg: '#991b1b' },
+  const map: Record<string, string> = {
+    open:          'badge-info',
+    in_progress:   'badge-warning',
+    waiting:       'badge-accent',
+    done:          'badge-success',
+    error:         'badge-error',
+    human_review:  'badge-warning',
   };
-  const theme = map[status] ?? { bg: '#f3f4f6', fg: '#374151' };
   return (
-    <span
-      style={{
-        display: 'inline-block',
-        padding: '2px 8px',
-        borderRadius: '4px',
-        background: theme.bg,
-        color: theme.fg,
-        fontSize: '0.75rem',
-        fontWeight: 700,
-        textTransform: 'capitalize',
-      }}
-    >
-      {status.replace('_', ' ')}
+    <span className={`badge ${map[status] ?? 'badge-neutral'}`}>
+      {status.replace(/_/g, ' ')}
     </span>
   );
 }
+
+// ---------------------------------------------------------------------------
+// Type badge
+// ---------------------------------------------------------------------------
 
 function TypeBadge({ type }: { type: string }) {
   const labels: Record<string, string> = {
@@ -75,75 +187,37 @@ function TypeBadge({ type }: { type: string }) {
     unknown:               'Unknown',
   };
   return (
-    <span
-      style={{
-        display: 'inline-block',
-        padding: '2px 8px',
-        borderRadius: '4px',
-        background: '#f3f4f6',
-        color: '#374151',
-        fontSize: '0.75rem',
-        fontWeight: 600,
-      }}
-    >
+    <span className="badge badge-neutral">
       {labels[type] ?? type}
     </span>
   );
 }
 
-function ChannelLabel({ channel }: { channel: string }) {
-  const icons: Record<string, string> = {
-    fax:            '☎',   // telephone
-    direct_message: '✉',   // envelope
-    portal:         '🌐',  // globe
-  };
-  const labels: Record<string, string> = {
-    fax:            'Fax',
-    direct_message: 'DM',
-    portal:         'Portal',
-  };
-  return (
-    <span style={{ fontSize: '0.82rem' }}>
-      {icons[channel] ?? ''} {labels[channel] ?? channel}
-    </span>
-  );
-}
+// ---------------------------------------------------------------------------
+// Assignee badge
+// ---------------------------------------------------------------------------
 
 function AssigneeBadge({ assignee }: { assignee: string }) {
   if (assignee === 'unassigned') {
-    return <span style={{ color: '#9ca3af', fontSize: '0.78rem' }}>Unassigned</span>;
+    return <span style={{ color: 'var(--color-ink-faint)', fontSize: '0.78rem' }}>Unassigned</span>;
   }
   if (assignee === 'human') {
-    return (
-      <span
-        style={{
-          display: 'inline-block',
-          padding: '1px 7px',
-          borderRadius: '4px',
-          background: '#d1fae5',
-          color: '#065f46',
-          fontSize: '0.75rem',
-          fontWeight: 700,
-        }}
-      >
-        Human
-      </span>
-    );
+    return <span className="badge badge-success">Human</span>;
   }
   const name = assignee.startsWith('agent:') ? assignee.replace('agent:', '') : assignee;
+  return <span className="badge badge-info">{name}</span>;
+}
+
+// ---------------------------------------------------------------------------
+// Channel source icon
+// ---------------------------------------------------------------------------
+
+function ChannelSource({ channel }: { channel: string }) {
+  const icon = CHANNEL_ICONS[channel] ?? '📬';
+  const label = CHANNEL_LABELS[channel] ?? channel;
   return (
-    <span
-      style={{
-        display: 'inline-block',
-        padding: '1px 7px',
-        borderRadius: '4px',
-        background: '#dbeafe',
-        color: '#1e40af',
-        fontSize: '0.75rem',
-        fontWeight: 700,
-      }}
-    >
-      {name}
+    <span style={{ fontSize: '0.82rem', display: 'inline-flex', alignItems: 'center', gap: '4px' }}>
+      {icon} {label}
     </span>
   );
 }
@@ -154,7 +228,7 @@ function AssigneeBadge({ assignee }: { assignee: string }) {
 
 export default function QueueDetailPage({ params }: { params: { key: string } }) {
   const queueKey = params.key;
-  const [items, setItems] = useState<WorkItem[]>([]);
+  const [items, setItems] = useState<WorkItemWithAgentState[]>([]);
   const [stale, setStale] = useState(false);
 
   async function fetchItems() {
@@ -163,7 +237,8 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
         cache: 'no-store',
       });
       if (!res.ok) throw new Error('non-ok');
-      const data = (await res.json()) as WorkItem[];
+      const json = (await res.json()) as { data: WorkItemWithAgentState[] } | WorkItemWithAgentState[];
+      const data = Array.isArray(json) ? json : (json.data ?? []);
       setItems(data);
       setStale(false);
     } catch {
@@ -175,9 +250,10 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
     void fetchItems();
     const interval = setInterval(() => void fetchItems(), 4_000);
     return () => clearInterval(interval);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queueKey]);
 
+  const isOutgoing = queueKey === 'roi_outgoing';
   const isHumanReview = queueKey === 'human_review';
 
   const queueLabel: Record<string, string> = {
@@ -190,160 +266,136 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
 
   return (
     <div>
+      {/* Breadcrumb + heading */}
       <div style={{ marginBottom: '20px' }}>
-        <a href="/queues" style={{ fontSize: '0.82rem', color: '#3b82f6', textDecoration: 'none' }}>
-          &larr; Queues
+        <a
+          href="/queues"
+          style={{ fontSize: '0.82rem', color: 'var(--color-accent)', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: '4px' }}
+        >
+          ← Queues
         </a>
-        <div style={{ display: 'flex', alignItems: 'baseline', gap: '12px', marginTop: '4px' }}>
-          <h1 style={{ fontSize: '1.75rem', fontWeight: 800, margin: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '6px', flexWrap: 'wrap' }}>
+          <h1 style={{ fontSize: '1.6rem', fontWeight: 800, margin: 0, color: 'var(--color-ink)' }}>
             {queueLabel[queueKey] ?? queueKey}
           </h1>
           {isHumanReview && (
-            <span
-              style={{
-                padding: '3px 10px',
-                background: '#ffedd5',
-                color: '#7c2d12',
-                borderRadius: '5px',
-                fontSize: '0.78rem',
-                fontWeight: 700,
-              }}
-            >
+            <span className="badge badge-warning" style={{ fontSize: '0.78rem', padding: '4px 12px' }}>
               Needs attention
             </span>
           )}
           {stale && (
-            <span style={{ fontSize: '0.75rem', color: '#f59e0b', fontWeight: 600 }}>stale</span>
+            <span style={{ fontSize: '0.75rem', color: 'var(--color-warning)', fontWeight: 600 }}>stale</span>
           )}
         </div>
-        <p style={{ color: '#6b7280', margin: '4px 0 0', fontSize: '0.85rem' }}>
+        <p style={{ color: 'var(--color-ink-muted)', margin: '4px 0 0', fontSize: '0.84rem' }}>
           {items.length} item{items.length !== 1 ? 's' : ''} — polling every 4s
         </p>
       </div>
 
+      {/* Empty state */}
       {items.length === 0 ? (
         <div
-          style={{
-            background: '#fff',
-            border: '1px solid #e5e7eb',
-            borderRadius: '10px',
-            padding: '40px',
-            textAlign: 'center',
-          }}
+          className="card"
+          style={{ padding: '48px 32px', textAlign: 'center' }}
         >
-          <div style={{ fontSize: '2rem', marginBottom: '8px' }}>
-            {isHumanReview ? '⚠️' : '✓'}
+          <div style={{ fontSize: '2rem', marginBottom: '10px' }}>
+            {isHumanReview ? '⚠️' : isOutgoing ? '📤' : '✓'}
           </div>
-          <p style={{ color: '#6b7280', margin: 0 }}>
+          <p style={{ color: 'var(--color-ink-muted)', margin: '0 0 6px', fontWeight: 600 }}>
             {isHumanReview
               ? 'No items awaiting review.'
+              : isOutgoing
+              ? 'No outbound ROI requests in flight.'
               : 'Queue is empty.'}
           </p>
-          <p style={{ color: '#9ca3af', fontSize: '0.82rem', margin: '6px 0 0' }}>
-            Inject a simulated fax from the{' '}
-            <a href="/queues" style={{ color: '#3b82f6' }}>
-              Queues board
-            </a>
-            .
+          <p style={{ color: 'var(--color-ink-faint)', fontSize: '0.82rem', margin: 0 }}>
+            {isOutgoing
+              ? 'Compose a new ROI request from the nav above.'
+              : 'Inject a simulated fax from the Queues board.'}
           </p>
+          {isOutgoing && (
+            <a
+              href="/roi/new"
+              className="btn btn-primary"
+              style={{ display: 'inline-flex', marginTop: '16px', textDecoration: 'none' }}
+            >
+              New ROI Request
+            </a>
+          )}
         </div>
       ) : (
         <div style={{ overflowX: 'auto' }}>
-          <table
-            style={{
-              width: '100%',
-              borderCollapse: 'collapse',
-              background: '#fff',
-              border: '1px solid #e5e7eb',
-              borderRadius: '10px',
-              overflow: 'hidden',
-              fontSize: '0.82rem',
-            }}
-          >
+          <table className="data-table">
             <thead>
-              <tr style={{ background: '#f9fafb', borderBottom: '1px solid #e5e7eb' }}>
-                <th style={thCell}>Created</th>
-                <th style={thCell}>Type</th>
-                <th style={thCell}>Channel</th>
-                <th style={thCell}>Patient</th>
-                <th style={thCell}>Org</th>
-                <th style={thCell}>Status</th>
-                <th style={thCell}>Confidence</th>
-                <th style={thCell}>Assignee</th>
-                {isHumanReview && <th style={thCell}>Review reason</th>}
+              <tr>
+                <th>Created</th>
+                <th>Type</th>
+                <th>Channel</th>
+                <th>Patient</th>
+                <th>Org</th>
+                <th>Status</th>
+                <th>Confidence</th>
+                <th>Assignee</th>
+                {isOutgoing && <th>Chase Progress</th>}
+                {isHumanReview && <th>Review Reason</th>}
               </tr>
             </thead>
             <tbody>
               {items.map((item) => (
                 <tr
                   key={item.id}
-                  style={{
-                    borderBottom: '1px solid #f3f4f6',
-                    cursor: 'pointer',
-                    transition: 'background 0.1s',
-                  }}
-                  onClick={() => {
-                    window.location.href = `/items/${item.id}`;
-                  }}
-                  onMouseEnter={(e) => {
-                    (e.currentTarget as HTMLTableRowElement).style.background = '#f0f9ff';
-                  }}
-                  onMouseLeave={(e) => {
-                    (e.currentTarget as HTMLTableRowElement).style.background = '';
-                  }}
+                  onClick={() => { window.location.href = `/items/${item.id}`; }}
                 >
-                  <td style={tdCell}>
+                  <td style={{ whiteSpace: 'nowrap' }}>
                     <TimeAgo iso={item.created_at} />
                   </td>
-                  <td style={tdCell}>
+                  <td>
                     <TypeBadge type={item.type} />
                   </td>
-                  <td style={tdCell}>
-                    <ChannelLabel channel={item.source_channel} />
+                  <td>
+                    <ChannelSource channel={item.source_channel} />
                   </td>
-                  <td style={tdCell}>
+                  <td>
                     {item.patient ? (
-                      <span>
+                      <span style={{ fontSize: '0.84rem' }}>
                         {item.patient.first_name} {item.patient.last_name}
                       </span>
                     ) : (
-                      <span style={{ color: '#9ca3af' }}>—</span>
+                      <span style={{ color: 'var(--color-ink-faint)' }}>—</span>
                     )}
                   </td>
-                  <td style={tdCell}>
+                  <td>
                     {item.org ? (
-                      <span>{item.org.name}</span>
+                      <span style={{ fontSize: '0.84rem' }}>{item.org.name}</span>
                     ) : (
-                      <span style={{ color: '#9ca3af' }}>—</span>
+                      <span style={{ color: 'var(--color-ink-faint)' }}>—</span>
                     )}
                   </td>
-                  <td style={tdCell}>
+                  <td>
                     <StatusBadge status={item.status} />
                   </td>
-                  <td style={tdCell}>
-                    <ConfidenceBadge confidence={item.confidence} />
+                  <td>
+                    <ConfidenceMeter confidence={item.confidence} />
                   </td>
-                  <td style={tdCell}>
+                  <td>
                     <AssigneeBadge assignee={item.assignee} />
                   </td>
+                  {isOutgoing && (
+                    <td>
+                      <ChaseProgress item={item} />
+                    </td>
+                  )}
                   {isHumanReview && (
-                    <td style={{ ...tdCell, maxWidth: '260px' }}>
+                    <td style={{ maxWidth: '260px' }}>
                       {item.review_reason ? (
                         <div
-                          style={{
-                            background: '#ffedd5',
-                            color: '#7c2d12',
-                            padding: '4px 8px',
-                            borderRadius: '4px',
-                            fontSize: '0.75rem',
-                            fontWeight: 600,
-                            lineHeight: 1.4,
-                          }}
+                          className="badge badge-warning"
+                          style={{ borderRadius: 'var(--radius-sm)', whiteSpace: 'normal', lineHeight: 1.4, padding: '4px 8px', display: 'block' }}
                         >
                           {item.review_reason}
                         </div>
                       ) : (
-                        <span style={{ color: '#9ca3af' }}>—</span>
+                        <span style={{ color: 'var(--color-ink-faint)' }}>—</span>
                       )}
                     </td>
                   )}
@@ -356,19 +408,3 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
     </div>
   );
 }
-
-const thCell: React.CSSProperties = {
-  padding: '10px 14px',
-  textAlign: 'left',
-  fontWeight: 700,
-  fontSize: '0.75rem',
-  color: '#6b7280',
-  textTransform: 'uppercase',
-  letterSpacing: '0.05em',
-  whiteSpace: 'nowrap',
-};
-
-const tdCell: React.CSSProperties = {
-  padding: '12px 14px',
-  verticalAlign: 'top',
-};

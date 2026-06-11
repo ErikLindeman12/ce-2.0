@@ -122,7 +122,7 @@ export type ToolName =
 export type WorkItemType = 'referral' | 'records_request_in' | 'records_request_out' | 'unknown';
 export type WorkItemStatus = 'open' | 'in_progress' | 'waiting' | 'done' | 'error';
 export type QueueKey = 'intake' | 'referrals' | 'roi_incoming' | 'roi_outgoing' | 'human_review';
-export type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice';
+export type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal';
 export type OutboundAttemptStatus = 'sent' | 'awaiting_response' | 'responded' | 'timed_out' | 'failed';
 
 export interface WorkQueue {
@@ -171,7 +171,7 @@ export interface OrgContact {
     fax?: string;
     email?: string;
     phone?: string;
-    preferred_channel?: OutboundChannel;
+    preferred_channel?: OutboundChannel | 'portal';
     simulation?: string;
   };
 }
@@ -299,6 +299,7 @@ export interface WorkItemSummary {
   reviewReason: string | null;
   confidence: Record<string, number>;
   extractedData: Record<string, unknown>;
+  agentState: Record<string, unknown>;
   patient: PatientSummary | null;
   org: { id: string; name: string } | null;
 }
@@ -383,6 +384,7 @@ export function toWorkItemSummary(item: WorkItem): WorkItemSummary {
     reviewReason: item.review_reason,
     confidence: item.confidence,
     extractedData: item.extracted_data,
+    agentState: item.agent_state,
     patient: item.patient
       ? toPatientSummary(item.patient as Patient)
       : null,

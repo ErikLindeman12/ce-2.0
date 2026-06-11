@@ -370,12 +370,14 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
   // --- ROI OUTGOING pipeline ---
   if (agent.queue_key === 'roi_outgoing') {
     const agentState = workItem.agent_state as Record<string, unknown>;
+    const refNo = `ROI-${workItem.id.slice(0, 8).toUpperCase()}`;
 
     // Response arrived (tick reopened the item) — close it out
     if (agentState['response_received'] && !alreadyDone.has('mark_complete')) {
+      const lastChannel = (agentState['last_channel'] as string | undefined) ?? 'unknown';
       return {
         action: 'mark_complete',
-        params: { note: 'Records received.' },
+        params: { note: `Records received via ${lastChannel} — ref ${refNo}.` },
         confidence: 0.98,
         rationale: 'Response received — marking complete',
       };
@@ -390,12 +392,14 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
       !alreadyDone.has('send_sms') &&
       !alreadyDone.has('place_call')
     ) {
+      // The send tool will use renderOutboundDocument via the tool registry.
+      // The channel is determined from the org's preferred_channel (set on the
+      // item's org_id). We always return send_fax here as the initial action —
+      // the actual channel used is determined inside the tool by looking up the
+      // org's preferred_channel from agent_state.chase_plan.channels[0].
       return {
         action: 'send_fax',
-        params: {
-          subject: 'Records Request',
-          body: 'Please provide the requested records at your earliest convenience.',
-        },
+        params: {},
         confidence: 0.9,
         rationale: 'Fresh outgoing ROI — sending initial request via preferred channel',
       };
