@@ -108,8 +108,10 @@ button, input, select, textarea {
   font-family: var(--font-mono);
   font-size: 0.82rem;
   line-height: 1.65;
-  white-space: pre-wrap;
-  word-break: break-word;
+  /* Fax/transmittal documents are fixed-width art — never wrap their lines;
+     scroll horizontally in narrow columns instead. */
+  white-space: pre;
+  overflow-x: auto;
 }
 
 /* -- Section labels -- */

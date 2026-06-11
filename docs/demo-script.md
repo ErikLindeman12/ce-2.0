@@ -16,6 +16,39 @@ enabled agent each ~5s, so queues visibly move on their own while you narrate.
 The curl blocks below are the headless equivalent (use "Tick now" / manual
 ticks instead when you want to step the world frame by frame).
 
+> **API note (post Workflow-1 upgrade):** `GET /api/work-items` and
+> `GET /api/work-items/<id>` now return a `{"data": ...}` envelope with
+> camelCase fields, and `POST /api/roi` returns `{"data":{"workItemId"}}` —
+> adjust the older `jq` snippets below accordingly (e.g. `.data[0]`).
+
+---
+
+## ⭐ Workflow 1 showcase — Outgoing ROI + multi-channel chase (upgraded)
+
+The most polished path; lead the demo with it.
+
+1. **Compose** (`/roi/new`): pick a patient → patient card. Search an org →
+   its **capability card** shows exactly which channels it supports
+   (Mass General has *no email* — watch the plan skip it), the preferred
+   channel starred, and a teal **On network** badge for Cleveland Clinic.
+   The **channel plan stepper** and a live **fax cover-sheet preview** update
+   as you type. Set **response wait** to 10s for a fast demo.
+2. **The chase** (send to UCSF Medical Center — never answers): open the item.
+   A chase-plan stepper tracks fax → email → SMS → voice; every attempt is a
+   card with the actual rendered document ("View Fax document" — cover sheet,
+   HIPAA notice, reference number). Voice shows "rang — no answer, voicemail
+   left." After the last channel: Human Review with the channel-by-channel
+   history.
+3. **On-network tier** (send to Cleveland Clinic): no fax goes out at all —
+   one **In-app** attempt appears in the **Provider Portal** (`/portal` →
+   Cleveland Clinic). Respond there with "Attach requested records" → the
+   Records Chaser completes the item on the next tick, audit actor
+   `portal:Cleveland Clinic`. Fax is the graceful degradation for everyone
+   not on the network; the portal is the upgrade path.
+4. **Responsive fax org** (send to Mayo Clinic): reply arrives in ~one wait
+   period with a rendered **RECORDS TRANSMITTAL** on the item; completion
+   note carries the ROI reference.
+
 ---
 
 ## Setup (run once before the demo)

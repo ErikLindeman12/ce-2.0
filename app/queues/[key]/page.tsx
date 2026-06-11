@@ -239,6 +239,20 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
       if (!res.ok) throw new Error('non-ok');
       const json = (await res.json()) as { data: WorkItemWithAgentState[] } | WorkItemWithAgentState[];
       const data = Array.isArray(json) ? json : (json.data ?? []);
+      // API rows are camelCase; render code reads snake_case — add aliases.
+      const CAMEL: Array<[string, string]> = [
+        ['createdAt', 'created_at'], ['updatedAt', 'updated_at'],
+        ['queueKey', 'queue_key'], ['sourceChannel', 'source_channel'],
+        ['reviewReason', 'review_reason'], ['agentState', 'agent_state'],
+        ['extractedData', 'extracted_data'], ['matchedPatientId', 'matched_patient_id'],
+        ['firstName', 'first_name'], ['lastName', 'last_name'],
+      ];
+      for (const row of data) {
+        const o = row as unknown as Record<string, unknown>;
+        for (const [c, s] of CAMEL) if (c in o && !(s in o)) o[s] = o[c];
+        const p = o['patient'] as Record<string, unknown> | null;
+        if (p) for (const [c, s] of CAMEL) if (c in p && !(s in p)) p[s] = p[c];
+      }
       setItems(data);
       setStale(false);
     } catch {

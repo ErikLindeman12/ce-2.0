@@ -1,7 +1,6 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { use } from 'react';
 import type { PortalAttempt } from '@/lib/portal';
 
 // ---------------------------------------------------------------------------
@@ -429,11 +428,11 @@ function AttemptCard({ attempt, orgId, onResponded }: AttemptCardProps) {
 // ---------------------------------------------------------------------------
 
 interface Props {
-  params: Promise<{ orgId: string }>;
+  params: { orgId: string };
 }
 
 export default function PortalInboxPage({ params }: Props) {
-  const { orgId } = use(params);
+  const { orgId } = params;
 
   const [attempts, setAttempts] = useState<PortalAttempt[]>([]);
   const [orgName, setOrgName] = useState<string>('');

@@ -100,6 +100,34 @@ function countdown(ts: string | null): string | null {
   return `${Math.ceil(s / 60)}m`;
 }
 
+// The API serves camelCase; parts of this page read snake_case. Add snake
+// aliases recursively so every read site works with either shape.
+const CAMEL_TO_SNAKE: Record<string, string> = {
+  createdAt: 'created_at', updatedAt: 'updated_at', attemptNo: 'attempt_no',
+  respondAfter: 'respond_after', reviewReason: 'review_reason',
+  queueKey: 'queue_key', sourceText: 'source_text', agentState: 'agent_state',
+  extractedData: 'extracted_data', sourceChannel: 'source_channel',
+  matchedPatientId: 'matched_patient_id', firstName: 'first_name',
+  lastName: 'last_name', toContact: 'to_contact', workItemId: 'work_item_id',
+};
+
+function aliasKeys<T>(v: T): T {
+  if (Array.isArray(v)) {
+    v.forEach(aliasKeys);
+    return v;
+  }
+  if (v && typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    for (const [camel, snake] of Object.entries(CAMEL_TO_SNAKE)) {
+      if (camel in o && !(snake in o)) o[snake] = o[camel];
+    }
+    for (const k of ['patient', 'org']) {
+      if (o[k] && typeof o[k] === 'object') aliasKeys(o[k]);
+    }
+  }
+  return v;
+}
+
 function getAgentState(item: WorkItemDetail['item']): AgentState {
   const raw = (item.agentState ?? item.agent_state ?? {}) as AgentState;
   return raw;
@@ -487,10 +515,10 @@ export default function WorkItemDetailPage() {
       const body = (await res.json()) as Record<string, unknown>;
       const raw = (body['data'] ?? body) as Record<string, unknown>;
       const data: WorkItemDetail = {
-        item: raw['item'] as WorkItemDetail['item'],
-        audit:             (raw['audit']            ?? raw['auditTrail']       ?? []) as AuditLogEntry[],
-        attempts:          (raw['attempts']         ?? raw['outboundAttempts'] ?? []) as OutboundAttempt[],
-        patientCandidates: (raw['patientCandidates'] ?? []) as Patient[],
+        item: aliasKeys(raw['item']) as WorkItemDetail['item'],
+        audit:             aliasKeys((raw['audit']            ?? raw['auditTrail']       ?? [])) as AuditLogEntry[],
+        attempts:          aliasKeys((raw['attempts']         ?? raw['outboundAttempts'] ?? [])) as OutboundAttempt[],
+        patientCandidates: aliasKeys((raw['patientCandidates'] ?? [])) as Patient[],
       };
       setDetail(data);
       setError(null);
