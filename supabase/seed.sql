@@ -61,3 +61,104 @@ INSERT INTO referral_requirements (org_id, provider_id, required_fields, custom_
    '{"preferredReferralWindow":"2 weeks"}'::jsonb)
 
 ON CONFLICT DO NOTHING;
+
+-- =============================================================================
+-- WORK QUEUE PLATFORM SEED DATA
+-- All inserts idempotent via ON CONFLICT clauses.
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- Work queues (5)
+-- ---------------------------------------------------------------------------
+INSERT INTO work_queues (key, name, description, sort_order) VALUES
+  ('intake',        'Intake',          'Incoming faxes and messages awaiting classification', 0),
+  ('referrals',     'Referrals',       'Inbound referral requests ready for processing',      1),
+  ('roi_incoming',  'ROI — Incoming',  'Incoming release-of-information / records requests',  2),
+  ('roi_outgoing',  'ROI — Outgoing',  'Outgoing records requests we sent; awaiting response',3),
+  ('human_review',  'Human Review',    'Items escalated for human decision',                  4)
+ON CONFLICT (key) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Mock patients (8, including two "Maria Garcia" with different DOBs)
+-- ---------------------------------------------------------------------------
+INSERT INTO patients (id, first_name, last_name, dob, mrn, phone) VALUES
+  ('a1b2c3d4-0001-0001-0001-000000000001', 'James',   'Whitfield', '1955-08-14', 'MRN-00101', '+1-608-555-0101'),
+  ('a1b2c3d4-0002-0002-0002-000000000002', 'Maria',   'Garcia',    '1981-03-04', 'MRN-00102', '+1-608-555-0102'),
+  ('a1b2c3d4-0003-0003-0003-000000000003', 'Maria',   'Garcia',    '1990-07-22', 'MRN-00103', '+1-608-555-0103'),
+  ('a1b2c3d4-0004-0004-0004-000000000004', 'Robert',  'Tanaka',    '1963-11-30', 'MRN-00104', '+1-608-555-0104'),
+  ('a1b2c3d4-0005-0005-0005-000000000005', 'Susan',   'Chen',      '1978-05-19', 'MRN-00105', '+1-608-555-0105'),
+  ('a1b2c3d4-0006-0006-0006-000000000006', 'David',   'Kim',       '1945-02-28', 'MRN-00106', '+1-608-555-0106'),
+  ('a1b2c3d4-0007-0007-0007-000000000007', 'Linda',   'Okafor',    '1972-09-07', 'MRN-00107', '+1-608-555-0107'),
+  ('a1b2c3d4-0008-0008-0008-000000000008', 'Thomas',  'Reyes',     '1988-12-03', 'MRN-00108', '+1-608-555-0108')
+ON CONFLICT (mrn) DO NOTHING;
+
+-- ---------------------------------------------------------------------------
+-- Organization contact info for outbound channels.
+-- org_mgh   → fax-only preferred (fax + preferred_channel = fax)
+-- org_ucsf  → "never answers" simulation flag (no_response)
+-- Others    → mixed channels
+-- ---------------------------------------------------------------------------
+UPDATE organizations SET contact = '{"fax":"+1-617-555-0142","email":"records@mass-general.example","phone":"+1-617-555-0143","preferred_channel":"fax"}'::jsonb
+  WHERE id = 'org_mgh';
+
+UPDATE organizations SET contact = '{"fax":"+1-415-555-0142","email":"records@ucsf.example","phone":"+1-415-555-0143","preferred_channel":"fax","simulation":"no_response"}'::jsonb
+  WHERE id = 'org_ucsf';
+
+UPDATE organizations SET contact = '{"fax":"+1-507-555-0142","email":"records@mayo.example","phone":"+1-507-555-0143","preferred_channel":"email"}'::jsonb
+  WHERE id = 'org_mayo';
+
+UPDATE organizations SET contact = '{"fax":"+1-608-555-0142","email":"records@mayo-wi.example","phone":"+1-608-555-0143","preferred_channel":"fax"}'::jsonb
+  WHERE id = 'org_mayo_wi';
+
+UPDATE organizations SET contact = '{"fax":"+1-216-555-0142","email":"records@cleveland.example","phone":"+1-216-555-0143","preferred_channel":"email"}'::jsonb
+  WHERE id = 'org_cleveland';
+
+UPDATE organizations SET contact = '{"fax":"+1-410-555-0142","email":"records@jhh.example","phone":"+1-410-555-0143","preferred_channel":"email"}'::jsonb
+  WHERE id = 'org_jhh';
+
+UPDATE organizations SET contact = '{"fax":"+1-510-555-0142","email":"records@kaiser.example","phone":"+1-510-555-0143","preferred_channel":"email"}'::jsonb
+  WHERE id = 'org_kaiser';
+
+UPDATE organizations SET contact = '{"fax":"+1-414-555-0142","email":"records@froedtert.example","phone":"+1-414-555-0143","preferred_channel":"fax"}'::jsonb
+  WHERE id = 'org_froedtert';
+
+UPDATE organizations SET contact = '{"fax":"+1-414-555-0242","email":"records@aurora.example","phone":"+1-414-555-0243","preferred_channel":"email"}'::jsonb
+  WHERE id = 'org_aurora';
+
+-- ---------------------------------------------------------------------------
+-- Default agents (3) — unique constraint on name makes ON CONFLICT work
+-- ---------------------------------------------------------------------------
+INSERT INTO agents (name, queue_key, enabled, instructions, tools, confidence_threshold, model) VALUES
+  (
+    'Intake Agent',
+    'intake',
+    true,
+    'Classify inbound documents, extract patient fields, match against the MPI, and route to the appropriate downstream queue. If confidence is below threshold on any step, escalate to Human Review with the specific question.',
+    '{classify_document,extract_fields,match_patient,advance_stage,escalate_to_human}',
+    0.8,
+    'heuristic'
+  ),
+  (
+    'ROI Fulfillment Agent',
+    'roi_incoming',
+    true,
+    'Verify that incoming records requests include a matched patient, a records description, and an authorization line. If complete, send records back via the requester org preferred channel and mark complete. If info is missing, send request_more_info outbound and set item to waiting.',
+    '{verify_requirements,send_fax,send_email,mark_complete,request_more_info,escalate_to_human}',
+    0.8,
+    'heuristic'
+  ),
+  (
+    'Records Chaser',
+    'roi_outgoing',
+    true,
+    'Send outgoing records requests and manage the chase loop. On a fresh item compose and send the initial request via the org preferred channel. When a response arrives mark the item complete with "records received".',
+    '{send_fax,send_email,send_sms,place_call,mark_complete,escalate_to_human}',
+    0.7,
+    'heuristic'
+  )
+ON CONFLICT (name) DO UPDATE
+  SET queue_key            = EXCLUDED.queue_key,
+      instructions         = EXCLUDED.instructions,
+      tools                = EXCLUDED.tools,
+      confidence_threshold = EXCLUDED.confidence_threshold,
+      model                = EXCLUDED.model;

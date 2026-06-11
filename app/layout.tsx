@@ -31,6 +31,18 @@ export default function RootLayout({ children }: { children: ReactNode }) {
           <span style={{ fontWeight: 800, fontSize: '1rem', letterSpacing: '0.02em', color: '#93c5fd' }}>
             CE 2.0
           </span>
+          <a href="/" style={{ color: '#cbd5e1', fontSize: '0.88rem', fontWeight: 500, textDecoration: 'none' }}>
+            Directory
+          </a>
+          <a href="/queues" style={{ color: '#cbd5e1', fontSize: '0.88rem', fontWeight: 500, textDecoration: 'none' }}>
+            Queues
+          </a>
+          <a href="/roi/new" style={{ color: '#cbd5e1', fontSize: '0.88rem', fontWeight: 500, textDecoration: 'none' }}>
+            New ROI Request
+          </a>
+          <a href="/agents" style={{ color: '#cbd5e1', fontSize: '0.88rem', fontWeight: 500, textDecoration: 'none' }}>
+            Agents
+          </a>
         </nav>
 
         <main style={{ maxWidth: '880px', margin: '0 auto', padding: '32px 24px' }}>{children}</main>
