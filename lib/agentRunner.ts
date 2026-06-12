@@ -352,6 +352,11 @@ export async function runDeliveryTurn(
       if (!fresh) return { actions, outcome: 'error' };
       item = fresh;
       if (item.status === 'done') return { actions, outcome: 'completed' };
+      // A tool that parked the case in 'waiting' (sends, request_more_info) ends
+      // the turn — the agent is now waiting on the world; the next event
+      // (response.received / attempt.timed_out) re-activates it. Without this a
+      // chase ladder fires every rung in a single turn.
+      if (item.status === 'waiting') return { actions, outcome: 'wait' };
     }
 
     return { actions, outcome: 'wait' };

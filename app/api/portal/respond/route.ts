@@ -14,6 +14,7 @@
 
 import { NextResponse, type NextRequest } from 'next/server';
 import { respondToAttempt } from '@/lib/portal';
+import { pumpEvents } from '@/lib/dispatcher';
 
 interface RespondBody {
   attemptId?: string;
@@ -61,6 +62,9 @@ export async function POST(req: NextRequest) {
       message,
       authorizationAttached: true,
     });
+    // Pump inline so the response.received cascade (merge authorization →
+    // re-verify → send records) runs before the portal poll refreshes.
+    await pumpEvents({ maxRounds: 2, deadlineMs: 5000 });
     return NextResponse.json({ data: { ok: true } });
   } catch (err) {
     const status =

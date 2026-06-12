@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { runTool } from '@/lib/tools';
+import { pumpEvents } from '@/lib/dispatcher';
 
 export async function POST(
   req: NextRequest,
@@ -20,6 +21,9 @@ export async function POST(
 
   try {
     const result = await runTool(body.tool, id, body.params ?? {}, 'human');
+    // Inline pump: tool-emitted events cascade before we respond, so human
+    // actions take effect immediately instead of waiting for the next tick.
+    await pumpEvents({ maxRounds: 2, deadlineMs: 5000 });
     if (!result.success) {
       return NextResponse.json({ error: result.error }, { status: 422 });
     }

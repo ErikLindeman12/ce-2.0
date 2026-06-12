@@ -50,6 +50,8 @@ export async function GET(
         audit,
         attempts,
         patientCandidates,
+        reviews: detail.reviews ?? [],
+        events: detail.events ?? [],
       },
     });
   } catch (err) {

@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { injectInbound } from '@/lib/simulate';
+import { pumpEvents } from '@/lib/dispatcher';
 import type { ScenarioKey, BatchKey } from '@/lib/sampleDocs';
 
 const VALID_SCENARIOS: ScenarioKey[] = [
@@ -30,8 +31,10 @@ export async function POST(req: NextRequest) {
   if (VALID_BATCHES.includes(scenario as BatchKey)) {
     try {
       const result = await injectInbound(scenario as BatchKey);
+      // Inline pump: routing + first agent turns happen before we respond.
+      const pump = await pumpEvents({ maxRounds: 2, deadlineMs: 5000 });
       return NextResponse.json(
-        { status: 'injected', itemIds: result.itemIds, count: result.itemIds.length, scenario },
+        { status: 'injected', itemIds: result.itemIds, count: result.itemIds.length, scenario, turns: pump.turns },
         { status: 201 },
       );
     } catch (err) {
@@ -52,8 +55,10 @@ export async function POST(req: NextRequest) {
 
   try {
     const result = await injectInbound(scenario as ScenarioKey);
+    // Inline pump: routing + first agent turns happen before we respond.
+    const pump = await pumpEvents({ maxRounds: 2, deadlineMs: 5000 });
     return NextResponse.json(
-      { status: 'injected', itemId: result.itemId, scenario },
+      { status: 'injected', itemId: result.itemId, scenario, turns: pump.turns },
       { status: 201 },
     );
   } catch (err) {

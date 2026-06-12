@@ -9,11 +9,15 @@
  * respondToAttempt now exists only for the authorization case:
  *   POST /api/portal/respond {attemptId, orgId, authorizationAttached:true}
  *
+ * Event substrate (docs/substrate-spec.md): this module only EMITS events —
+ * submit → `document.received`, respond → `response.received`. It never pumps;
+ * the API routes call pumpEvents() after the mutation so cascades run inline.
+ *
  * getPortalInbox is kept as an alias but marks the old path — prefer getPortalRequests.
  */
 
 import { getSupabase } from './supabase';
-import { handleAttemptResponse } from './simulate';
+import { emitEvent } from './events';
 import { createWorkItem } from './workItems';
 
 // ---------------------------------------------------------------------------
@@ -44,6 +48,8 @@ export interface PortalAttempt {
 /** GET /api/portal/requests item shape */
 export interface PortalRequest {
   itemId: string;
+  /** Alias of itemId — the portal page keys cards on `id`. */
+  id: string;
   /** 'processing' | 'action_needed' | 'under_review' | 'completed' */
   status: 'processing' | 'action_needed' | 'under_review' | 'completed';
   queueKey: string;
@@ -51,8 +57,12 @@ export interface PortalRequest {
   createdAt: string;
   recordsRequested: string | null;
   patientName: string | null;
+  /** Name parts for the portal card (page normalizes firstName → first_name). */
+  patient: { firstName: string; lastName: string } | null;
   /** Populated when status='action_needed' — the pending request_more_info attempt id */
   pendingInfoAttemptId: string | null;
+  /** Populated when status='action_needed' — attempt object the portal page reads. */
+  pendingAuthAttempt: { id: string; status: string } | null;
   /** Populated when status='completed' — the final records-response document */
   responseDocument: string | null;
   /** Populated when status='completed' — channel records were returned on */
@@ -87,7 +97,9 @@ export interface SubmitPortalRequestPayload {
  * - type = 'records_request_in'
  * - queue_key = 'intake' (flows normal intake → roi_incoming pipeline)
  * - org_id = submitting org
- * - source_text = structured PORTAL SUBMISSION document (labeled lines for extractor)
+ * - source_text = structured PORTAL SUBMISSION document (labeled lines floor
+ *   extraction at 0.92)
+ * - emits `document.received` — the Intake Agent subscription classifies it
  * - audit: actor=portal:<org>, action=portal_submission
  */
 export async function submitPortalRequest(
@@ -142,6 +154,16 @@ export async function submitPortalRequest(
     },
   });
 
+  // The submission becomes a fact on the event log — the Intake Agent's
+  // `document.received` subscription picks it up and classifies. The route
+  // pumps after this returns (lib never pumps).
+  await emitEvent({
+    type: 'document.received',
+    caseId: item.id,
+    payload: { channel: 'portal', orgId: payload.orgId, orgName },
+    actor: `portal:${orgName}`,
+  });
+
   // Audit the submission
   await sb.from('audit_log').insert({
     work_item_id: item.id,
@@ -177,11 +199,11 @@ export async function submitPortalRequest(
 /**
  * Return the org's submitted portal items with plain-language status mapping.
  *
- * Status mapping (per spec §3):
- *  intake / processing     → 'processing'
- *  waiting after request_more_info → 'action_needed' (pendingInfoAttemptId populated)
- *  human_review            → 'under_review'
+ * Status mapping (precedence completed > under_review > action_needed > processing):
  *  done                    → 'completed' (responseDocument + responseChannel populated)
+ *  pending review_requests row (or queue_key='human_review' fallback) → 'under_review'
+ *  waiting after request_more_info → 'action_needed' (pendingInfoAttemptId populated)
+ *  everything else         → 'processing'
  */
 export async function getPortalRequests(orgId: string): Promise<PortalRequest[]> {
   const sb = getSupabase();
@@ -192,7 +214,7 @@ export async function getPortalRequests(orgId: string): Promise<PortalRequest[]>
     .select(
       `id, queue_key, status, created_at, extracted_data, agent_state,
        patient:patients(first_name,last_name),
-       outbound_attempts(id,channel,status,payload,response,attempt_no)`,
+       outbound_attempts(id,channel,status,kind,payload,response,attempt_no)`,
     )
     .eq('org_id', orgId)
     .eq('source_channel', 'portal')
@@ -200,7 +222,27 @@ export async function getPortalRequests(orgId: string): Promise<PortalRequest[]>
 
   if (error) throw new Error(`portal requests query failed: ${error.message}`);
 
-  return ((items ?? []) as unknown[]).map((row) => {
+  const rows = (items ?? []) as unknown[];
+
+  // 'under_review' is derived from PENDING review_requests (the substrate's
+  // human-side lock), with queue_key='human_review' kept as a fallback.
+  const caseIds = rows.map((row) => (row as { id: string }).id);
+  const pendingReviewCaseIds = new Set<string>();
+  if (caseIds.length > 0) {
+    const { data: reviews, error: reviewErr } = await sb
+      .from('review_requests')
+      .select('case_id')
+      .in('case_id', caseIds)
+      .eq('status', 'pending');
+    if (reviewErr) {
+      console.log('[portal.requests]', JSON.stringify({ warn: 'reviews query failed', error: reviewErr.message }));
+    }
+    for (const rr of (reviews ?? []) as Array<{ case_id: string }>) {
+      pendingReviewCaseIds.add(rr.case_id);
+    }
+  }
+
+  return rows.map((row) => {
     const r = row as {
       id: string;
       queue_key: string;
@@ -213,6 +255,7 @@ export async function getPortalRequests(orgId: string): Promise<PortalRequest[]>
         id: string;
         channel: string;
         status: string;
+        kind: string | null;
         attempt_no: number;
         payload: Record<string, unknown>;
         response: Record<string, unknown> | null;
@@ -223,18 +266,22 @@ export async function getPortalRequests(orgId: string): Promise<PortalRequest[]>
     const agentState = r.agent_state ?? {};
     const attempts = r.outbound_attempts ?? [];
 
-    // Derive patient name
-    const patientName = r.patient
-      ? `${r.patient.first_name} ${r.patient.last_name}`
-      : extracted['patient_first_name']
-        ? `${extracted['patient_first_name']} ${extracted['patient_last_name'] ?? ''}`.trim()
-        : null;
+    // Derive patient name (joined patient wins; extracted fields as fallback)
+    const firstName =
+      r.patient?.first_name ?? ((extracted['patient_first_name'] as string | undefined) ?? '');
+    const lastName =
+      r.patient?.last_name ?? ((extracted['patient_last_name'] as string | undefined) ?? '');
+    const patient = firstName || lastName ? { firstName, lastName } : null;
+    const patientName = patient
+      ? `${patient.firstName} ${patient.lastName}`.trim()
+      : null;
 
     const recordsRequested = (extracted['records_requested'] as string | undefined) ?? null;
 
     // Map to plain-language status
     let portalStatus: PortalRequest['status'];
     let pendingInfoAttemptId: string | null = null;
+    let pendingAuthAttempt: { id: string; status: string } | null = null;
     let responseDocument: string | null = null;
     let responseChannel: string | null = null;
 
@@ -242,41 +289,51 @@ export async function getPortalRequests(orgId: string): Promise<PortalRequest[]>
       portalStatus = 'completed';
       // The records WE sent live in the fulfillment attempt's payload.document
       // (the rendered Records Response/transmittal) — attempt.response is just
-      // the delivery ack. Prefer the fulfillment document, whatever channel it
-      // went out on.
-      const fulfillment = attempts.find(
-        (a) =>
-          a.payload?.['kind'] === 'records_response' ||
-          String(a.payload?.['subject'] ?? '').includes('Records Response'),
-      );
+      // the delivery ack. Typed kind column first; payload sniff as fallback.
+      const fulfillment =
+        attempts.find((a) => a.kind === 'records_response') ??
+        attempts.find(
+          (a) =>
+            a.payload?.['kind'] === 'records_response' ||
+            String(a.payload?.['subject'] ?? '').includes('Records Response'),
+        );
       const anyResponded = attempts.find((a) => a.status === 'responded' && a.response);
       responseDocument =
         ((fulfillment?.payload?.['document'] as string | undefined) ??
           (anyResponded?.response?.['document'] as string | undefined)) ?? null;
       responseChannel = fulfillment?.channel ?? anyResponded?.channel ?? null;
-    } else if (r.queue_key === 'human_review') {
+    } else if (pendingReviewCaseIds.has(r.id) || r.queue_key === 'human_review') {
       portalStatus = 'under_review';
     } else if (r.status === 'waiting' && agentState['more_info_sent']) {
-      // Agent sent request_more_info — find the pending attempt
+      // Agent sent request_more_info — find the pending attempt (typed kind
+      // column first; payload sniff as fallback). Portal-aimed more-info
+      // attempts stay sent/awaiting_response until the portal user responds.
       portalStatus = 'action_needed';
       const moreInfoAttempt = attempts.find(
-        (a) => (a.payload?.['kind'] === 'request_more_info') &&
-               (a.status === 'sent' || a.status === 'awaiting_response'),
+        (a) =>
+          (a.kind === 'request_more_info' || a.payload?.['kind'] === 'request_more_info') &&
+          (a.status === 'sent' || a.status === 'awaiting_response'),
       );
       pendingInfoAttemptId = moreInfoAttempt?.id ?? null;
+      pendingAuthAttempt = moreInfoAttempt
+        ? { id: moreInfoAttempt.id, status: moreInfoAttempt.status }
+        : null;
     } else {
       portalStatus = 'processing';
     }
 
     return {
       itemId: r.id,
+      id: r.id,
       status: portalStatus,
       queueKey: r.queue_key,
       itemStatus: r.status,
       createdAt: r.created_at,
       recordsRequested,
       patientName,
+      patient,
       pendingInfoAttemptId,
+      pendingAuthAttempt,
       responseDocument,
       responseChannel,
     } satisfies PortalRequest;
@@ -295,10 +352,10 @@ export async function respondToAttempt(
   const sb = getSupabase();
   const now = new Date().toISOString();
 
-  // Fetch the attempt + parent work item to validate state
+  // Fetch the attempt to validate state (kind/channel/attempt_no feed the event)
   const { data: attempt, error: fetchErr } = await sb
     .from('outbound_attempts')
-    .select('id,status,work_item_id,to_org_id,work_item:work_items(id,queue_key,extracted_data)')
+    .select('id,status,work_item_id,to_org_id,channel,kind,attempt_no,payload')
     .eq('id', payload.attemptId)
     .single();
 
@@ -306,17 +363,15 @@ export async function respondToAttempt(
     throw Object.assign(new Error('Attempt not found'), { status: 404 });
   }
 
-  // Supabase returns joined one-to-one as object, but TypeScript infers array — cast via unknown
   const a = attempt as unknown as {
     id: string;
     status: string;
     work_item_id: string;
     to_org_id: string | null;
-    work_item: {
-      id: string;
-      queue_key: string;
-      extracted_data: Record<string, unknown>;
-    } | null;
+    channel: string;
+    kind: string | null;
+    attempt_no: number;
+    payload: Record<string, unknown> | null;
   };
 
   // Guard: only allow responding on attempts addressed to this org
@@ -386,16 +441,23 @@ export async function respondToAttempt(
     },
   });
 
-  // Reopen the work item so the agent resumes on next tick
-  const workItem = a.work_item;
-  if (workItem) {
-    await handleAttemptResponse(
-      a.work_item_id,
-      workItem.queue_key,
-      responseObj,
-      workItem.extracted_data ?? {},
-    );
-  }
+  // The response becomes a fact on the event log. The subscribed agent's
+  // on_event merge reads payload.response.* (e.g. response.authorization →
+  // extracted.authorization). Dedupe key matches the world-sim's so the same
+  // attempt can never produce two response.received events. The route pumps.
+  await emitEvent({
+    type: 'response.received',
+    caseId: a.work_item_id,
+    payload: {
+      attemptId: a.id,
+      channel: a.channel,
+      attemptNo: a.attempt_no,
+      kind: a.kind ?? ((a.payload?.['kind'] as string | undefined) ?? null),
+      response: responseObj,
+    },
+    actor: `portal:${orgName}`,
+    dedupeKey: `attempt:${a.id}:responded`,
+  });
 
   console.log(
     '[portal.respondToAttempt]',

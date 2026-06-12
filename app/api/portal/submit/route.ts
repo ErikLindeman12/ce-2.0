@@ -1,5 +1,6 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { submitPortalRequest } from '@/lib/portal';
+import { pumpEvents } from '@/lib/dispatcher';
 
 interface SubmitBody {
   orgId?: string;
@@ -43,6 +44,9 @@ export async function POST(req: NextRequest) {
       authorizationAttached: authorizationAttached ?? false,
       priority,
     });
+    // Pump inline so the document.received cascade (classify → route → agent
+    // turns) runs before the portal poll sees the new request.
+    await pumpEvents({ maxRounds: 2, deadlineMs: 5000 });
     return NextResponse.json({ data: { itemId: result.itemId } }, { status: 201 });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

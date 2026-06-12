@@ -11,6 +11,10 @@
  *   explicit patientId wins, re-match on patient-field change, re-route via
  *   events, and re-activate ONLY the requesting agent via a targeted delivery.
  *
+ * Origin-queue return: createReviewRequest snapshots the case's queue_key into
+ * options.origin_queue; once the last pending review is answered and nothing
+ * else routed the case, `case.moved {to: origin}` sends it back home.
+ *
  * Circular-import rule: tools.ts statically imports this module, so approved
  * proposals execute via a DYNAMIC import of runTool inside the function body.
  */
@@ -72,6 +76,20 @@ export async function createReviewRequest(
     return existing[0] as ReviewRequest;
   }
 
+  // ORIGIN-QUEUE capture: remember where the case sat BEFORE the
+  // review.requested routing rule moves it (the return path target).
+  // Caller-provided origin_queue wins (lets a follow-up review inherit it).
+  const options: Record<string, unknown> = { ...(input.options ?? {}) };
+  if (options['origin_queue'] === undefined) {
+    const { data: caseRow } = await sb
+      .from('work_items')
+      .select('queue_key')
+      .eq('id', input.caseId)
+      .maybeSingle();
+    const originQueue = (caseRow as { queue_key?: string } | null)?.queue_key;
+    if (originQueue) options['origin_queue'] = originQueue;
+  }
+
   const { data, error } = await sb
     .from('review_requests')
     .insert({
@@ -81,7 +99,7 @@ export async function createReviewRequest(
       question: input.question,
       proposal: input.proposal ?? null,
       candidates: input.candidates ?? null,
-      options: input.options ?? null,
+      options,
       status: 'pending',
     })
     .select('*')
@@ -277,6 +295,7 @@ async function answerApprove(review: ReviewRequest, actor: string): Promise<Tool
     actor,
   });
   await auditAnswer(review, actor, 'approve');
+  await maybeReturnToOrigin(review, false);
 
   console.log(
     '[reviews.answer]',
@@ -296,14 +315,21 @@ async function answerReject(review: ReviewRequest, actor: string): Promise<ToolR
   });
 
   // Preserve today's surface: a rejected proposal becomes a manual exception.
+  // The exception inherits the ORIGINAL origin_queue so resolving it later
+  // can still return the case to where the work started.
+  const inheritedOrigin = review.options?.['origin_queue'] as string | undefined;
   await createReviewRequest({
     caseId: review.case_id,
     agentId: review.agent_id,
     kind: 'exception',
     question: `Proposed ${review.proposal?.action ?? 'action'} rejected — handle manually`,
+    options: inheritedOrigin ? { origin_queue: inheritedOrigin } : undefined,
   });
 
   await auditAnswer(review, actor, 'reject');
+  // Self-guarding: the new exception review is pending, so this is a no-op
+  // until the exception itself is answered — kept for symmetry.
+  await maybeReturnToOrigin(review, false);
   console.log('[reviews.answer]', JSON.stringify({ reviewId: review.id, decision: 'reject' }));
   return { success: true };
 }
@@ -419,6 +445,12 @@ async function answerResolve(
   }
 
   await auditAnswer(review, actor, 'resolve');
+
+  // 6) Origin-queue return: only when this answer did not already route the
+  //    case (an explicit queueKey emitted case.moved; a type change emitted
+  //    document.classified — the Router handles both).
+  await maybeReturnToOrigin(review, Boolean(queueKey || newType));
+
   console.log(
     '[reviews.answer]',
     JSON.stringify({ reviewId: review.id, decision: 'resolve', changedKeys, patientId: patientId ?? null, queueKey: queueKey ?? null, type: newType ?? null }),
@@ -429,6 +461,68 @@ async function answerResolve(
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
+
+/**
+ * ORIGIN-QUEUE RETURN: the review.requested routing rule moved the case to a
+ * review queue (human_review); once the answer is in, send the case back to
+ * where it came from — UNLESS the answer already caused routing, another
+ * review is still pending, or the case is already home. Emits `case.moved`
+ * for the Router (the only queue_key writer); callers pump.
+ */
+async function maybeReturnToOrigin(review: ReviewRequest, causedRouting: boolean): Promise<void> {
+  if (causedRouting) return;
+
+  const sb = getSupabase();
+
+  // Prefer the routing history over the creation-time snapshot: a review opened
+  // mid-turn can capture origin_queue BEFORE that turn's classification routing
+  // applied (events route after the turn). The latest case.routed target that
+  // is not a review queue is where the case actually belongs.
+  let origin = review.options?.['origin_queue'] as string | undefined;
+  const { data: reviewQueues } = await sb.from('work_queues').select('key').eq('kind', 'review');
+  const reviewKeys = new Set(((reviewQueues ?? []) as Array<{ key: string }>).map((q) => q.key));
+  const { data: routedEvents } = await sb
+    .from('events')
+    .select('payload')
+    .eq('case_id', review.case_id)
+    .eq('type', 'case.routed')
+    .order('seq', { ascending: false })
+    .limit(10);
+  for (const ev of (routedEvents ?? []) as Array<{ payload: Record<string, unknown> }>) {
+    const q = ev.payload?.['queue'] as string | undefined;
+    if (q && !reviewKeys.has(q)) {
+      origin = q;
+      break;
+    }
+  }
+  if (!origin) return;
+  const { data: caseRow } = await sb
+    .from('work_items')
+    .select('queue_key')
+    .eq('id', review.case_id)
+    .maybeSingle();
+  const current = (caseRow as { queue_key?: string } | null)?.queue_key;
+  if (!current || current === origin) return;
+
+  const { data: pending } = await sb
+    .from('review_requests')
+    .select('id')
+    .eq('case_id', review.case_id)
+    .eq('status', 'pending')
+    .limit(1);
+  if (pending && pending.length > 0) return;
+
+  await emitEvent({
+    type: 'case.moved',
+    caseId: review.case_id,
+    payload: { to: origin, reason: 'review_answered' },
+    actor: 'router',
+  });
+  console.log(
+    '[reviews.return_to_origin]',
+    JSON.stringify({ reviewId: review.id, caseId: review.case_id, from: current, to: origin }),
+  );
+}
 
 async function setReviewStatus(reviewId: string, status: 'answered' | 'void'): Promise<void> {
   await getSupabase().from('review_requests').update({ status }).eq('id', reviewId);

@@ -2,17 +2,21 @@
  * lib/workItems.ts — CRUD + queue queries for work items.
  *
  * list(queueKey?)      → WorkItem[] with patient/org joins
- * get(id)              → { item, auditTrail, outboundAttempts, patientCandidates? }
+ * get(id)              → { item, auditTrail, outboundAttempts, patientCandidates?, reviews, events }
  * counts()             → Record<QueueKey, number>
  * create(payload)      → WorkItem
  */
 
 import { getSupabase } from './supabase';
+import { listEvents } from './events';
+import { toReviewRequestSummary } from './types';
 import type {
   AuditLogEntry,
   OutboundAttempt,
   Patient,
   QueueKey,
+  ReviewRequest,
+  ReviewRequestSummary,
   WorkItem,
   WorkQueue,
 } from './types';
@@ -45,12 +49,25 @@ export async function listWorkItems(queueKey?: string): Promise<WorkItem[]> {
 // Get a single work item with full detail
 // ---------------------------------------------------------------------------
 
+/** Minimal event shape for the item-detail timeline (additive API field). */
+export interface CaseEventSummary {
+  id: string;
+  type: string;
+  actor: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
 export interface WorkItemDetail {
   item: WorkItem;
   auditTrail: AuditLogEntry[];
   outboundAttempts: OutboundAttempt[];
-  /** Populated when item is in human_review due to ambiguous patient match */
+  /** Populated from the latest pending review's candidates (legacy review_reason parse as fallback) */
   patientCandidates?: Patient[];
+  /** All review requests for the case, newest first (agent names joined). */
+  reviews: ReviewRequestSummary[];
+  /** The case's last 30 events, newest first — the item-page timeline. */
+  events: CaseEventSummary[];
 }
 
 export async function getWorkItem(id: string): Promise<WorkItemDetail | null> {
@@ -68,7 +85,7 @@ export async function getWorkItem(id: string): Promise<WorkItemDetail | null> {
 
   if (error || !item) return null;
 
-  const [auditRes, attemptsRes] = await Promise.all([
+  const [auditRes, attemptsRes, reviewsRes, caseEvents, agentNames] = await Promise.all([
     sb
       .from('audit_log')
       .select('*')
@@ -79,16 +96,45 @@ export async function getWorkItem(id: string): Promise<WorkItemDetail | null> {
       .select('*')
       .eq('work_item_id', id)
       .order('attempt_no', { ascending: true }),
+    sb
+      .from('review_requests')
+      .select('*')
+      .eq('case_id', id)
+      .order('created_at', { ascending: false }),
+    listEvents({ caseId: id, limit: 30 }),
+    agentNameMap(),
   ]);
 
   const wi = item as unknown as WorkItem;
+  const reviewRows = (reviewsRes.data ?? []) as unknown as ReviewRequest[];
+  const pendingReviews = reviewRows.filter((r) => r.status === 'pending');
 
-  // If in human_review with a patient-match question, fetch candidates.
+  // Patient candidates: the latest pending review's candidates jsonb wins —
+  // rows were stored from matchPatientHeuristic's Patient rows (snake_case).
+  let patientCandidates: Patient[] | undefined;
+  const withCandidates = pendingReviews.find(
+    (r) => Array.isArray(r.candidates) && r.candidates.length > 0,
+  );
+  if (withCandidates) {
+    patientCandidates = (withCandidates.candidates ?? []).map((c) => {
+      const row = c as Record<string, unknown>;
+      return {
+        id: String(row['id'] ?? ''),
+        first_name: String(row['first_name'] ?? row['firstName'] ?? ''),
+        last_name: String(row['last_name'] ?? row['lastName'] ?? ''),
+        dob: String(row['dob'] ?? ''),
+        mrn: String(row['mrn'] ?? ''),
+        phone: (row['phone'] as string | null) ?? null,
+        created_at: String(row['created_at'] ?? ''),
+      } as Patient;
+    });
+  }
+
+  // Fallback (legacy string-parse) when no pending review carries candidates.
   // Covers two cases:
   //   - Ambiguous (two named patients): review_reason includes "patients named"
   //   - Fuzzy single-candidate: review_reason starts with "Closest MPI match is"
-  let patientCandidates: Patient[] | undefined;
-  if (wi.queue_key === 'human_review' && wi.review_reason) {
+  if ((!patientCandidates || patientCandidates.length === 0) && wi.queue_key === 'human_review' && wi.review_reason) {
     const extracted = wi.extracted_data as Record<string, string>;
 
     if (wi.review_reason.includes('patients named')) {
@@ -118,13 +164,42 @@ export async function getWorkItem(id: string): Promise<WorkItemDetail | null> {
     }
   }
 
+  // ApprovalBanner compat: synthesize agent_state.pending_approval at READ time
+  // from the latest pending 'approval' review — never written to the DB.
+  const approval = pendingReviews.find((r) => r.kind === 'approval' && r.proposal);
+  if (approval?.proposal) {
+    wi.agent_state = {
+      ...(wi.agent_state ?? {}),
+      pending_approval: {
+        action: approval.proposal.action,
+        params: approval.proposal.params,
+        confidence: approval.proposal.confidence,
+        rationale: approval.proposal.rationale,
+        agentId: approval.agent_id,
+        agentName: (approval.agent_id && agentNames.get(approval.agent_id)) || 'Agent',
+        reviewId: approval.id,
+      },
+    };
+  }
+
   return {
     item: wi,
-    auditTrail: await withAgentNames(
-      (auditRes.data ?? []) as unknown as AuditLogEntry[],
-    ),
+    auditTrail: ((auditRes.data ?? []) as unknown as AuditLogEntry[]).map((e) => ({
+      ...e,
+      actor: displayActor(e.actor, agentNames),
+    })),
     outboundAttempts: (attemptsRes.data ?? []) as unknown as OutboundAttempt[],
     patientCandidates,
+    reviews: reviewRows.map((r) =>
+      toReviewRequestSummary(r, r.agent_id ? agentNames.get(r.agent_id) ?? null : null),
+    ),
+    events: caseEvents.map((e) => ({
+      id: e.id,
+      type: e.type,
+      actor: displayActor(e.actor, agentNames),
+      payload: e.payload,
+      createdAt: e.created_at,
+    })),
   };
 }
 
@@ -132,17 +207,23 @@ export async function getWorkItem(id: string): Promise<WorkItemDetail | null> {
 // Replace raw `agent:<uuid>` actors with `agent:<Name>` for display
 // ---------------------------------------------------------------------------
 
-async function withAgentNames(entries: AuditLogEntry[]): Promise<AuditLogEntry[]> {
-  if (!entries.some((e) => e.actor.startsWith('agent:'))) return entries;
+async function agentNameMap(): Promise<Map<string, string>> {
   const { data } = await getSupabase().from('agents').select('id,name');
-  const names = new Map(
+  return new Map(
     ((data ?? []) as Array<{ id: string; name: string }>).map((a) => [a.id, a.name]),
   );
-  return entries.map((e) => {
-    if (!e.actor.startsWith('agent:')) return e;
-    const name = names.get(e.actor.slice('agent:'.length));
-    return name ? { ...e, actor: `agent:${name}` } : e;
-  });
+}
+
+function displayActor(actor: string, names: Map<string, string>): string {
+  if (!actor.startsWith('agent:')) return actor;
+  const name = names.get(actor.slice('agent:'.length));
+  return name ? `agent:${name}` : actor;
+}
+
+async function withAgentNames(entries: AuditLogEntry[]): Promise<AuditLogEntry[]> {
+  if (!entries.some((e) => e.actor.startsWith('agent:'))) return entries;
+  const names = await agentNameMap();
+  return entries.map((e) => ({ ...e, actor: displayActor(e.actor, names) }));
 }
 
 // ---------------------------------------------------------------------------

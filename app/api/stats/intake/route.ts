@@ -1,8 +1,13 @@
 /**
  * GET /api/stats/intake
  *
- * Returns aggregate intake statistics computed from audit_log + work_items.
- * All-time counts; no date math required.
+ * Returns aggregate intake statistics computed from audit_log + events +
+ * review_requests + work_items. All-time counts; no date math required.
+ *
+ * Substrate re-derivations (agents no longer call advance_stage):
+ * - autoRouted = distinct cases with a `case.routed` event whose
+ *   `document.classified` came from an agent actor.
+ * - escalated = review_requests created; resolvedByHuman = reviews answered.
  *
  * Response shape (pinned):
  * {
@@ -43,40 +48,48 @@ export async function GET() {
 
     const processed = processedIds.length;
 
-    // Auto-routed: items that were classified AND have an advance_stage audit entry
-    const { data: advanceRows } = await sb
-      .from('audit_log')
-      .select('work_item_id')
-      .eq('action', 'advance_stage')
-      .in('work_item_id', processed > 0 ? processedIds : ['__none__']);
+    // Auto-routed: distinct cases the Router placed (`case.routed`) whose
+    // classification came from an agent (`document.classified` actor agent:*).
+    // Two cheap queries over events — agents no longer call advance_stage.
+    const { data: agentClassifiedRows } = await sb
+      .from('events')
+      .select('case_id')
+      .eq('type', 'document.classified')
+      .like('actor', 'agent:%');
 
-    const autoRoutedIds = new Set(
-      (advanceRows ?? []).map((r) => (r as { work_item_id: string }).work_item_id),
+    const agentClassifiedIds = new Set(
+      (agentClassifiedRows ?? [])
+        .map((r) => (r as { case_id: string | null }).case_id)
+        .filter(Boolean) as string[],
     );
-    const autoRouted = autoRoutedIds.size;
 
-    // Escalated: items that have an escalate_to_human audit entry originating from intake
-    const { data: escalateRows } = await sb
-      .from('audit_log')
-      .select('work_item_id')
-      .eq('action', 'escalate_to_human')
-      .in('work_item_id', processed > 0 ? processedIds : ['__none__']);
+    let autoRouted = 0;
+    if (agentClassifiedIds.size > 0) {
+      const { data: routedRows } = await sb
+        .from('events')
+        .select('case_id')
+        .eq('type', 'case.routed');
 
-    const escalatedIds = new Set(
-      (escalateRows ?? []).map((r) => (r as { work_item_id: string }).work_item_id),
-    );
-    const escalated = escalatedIds.size;
+      const autoRoutedIds = new Set(
+        (routedRows ?? [])
+          .map((r) => (r as { case_id: string | null }).case_id)
+          .filter((id): id is string => Boolean(id) && agentClassifiedIds.has(id as string)),
+      );
+      autoRouted = autoRoutedIds.size;
+    }
 
-    // Resolved by human: items that have a resolve_review audit entry
-    const { data: resolveRows } = await sb
-      .from('audit_log')
-      .select('work_item_id')
-      .eq('action', 'resolve_review')
-      .in('work_item_id', processed > 0 ? processedIds : ['__none__']);
+    // Escalated: review requests created (the substrate's escalation surface).
+    const { count: escalatedCount } = await sb
+      .from('review_requests')
+      .select('id', { count: 'exact', head: true });
+    const escalated = escalatedCount ?? 0;
 
-    const resolvedByHuman = new Set(
-      (resolveRows ?? []).map((r) => (r as { work_item_id: string }).work_item_id),
-    ).size;
+    // Resolved by human: review requests answered.
+    const { count: resolvedCount } = await sb
+      .from('review_requests')
+      .select('id', { count: 'exact', head: true })
+      .eq('status', 'answered');
+    const resolvedByHuman = resolvedCount ?? 0;
 
     // Average confidence scores across all intake-processed items
     let avgClassify = 0;

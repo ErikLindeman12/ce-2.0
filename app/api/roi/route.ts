@@ -1,7 +1,10 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { getSupabase } from '@/lib/supabase';
 import { createWorkItem } from '@/lib/workItems';
-import { buildChannelPlan, renderOutboundDocument } from '@/lib/outbound';
+import { buildChannelPlan } from '@/lib/outbound';
+import { emitEvent } from '@/lib/events';
+import { pumpEvents } from '@/lib/dispatcher';
+import { findAgentSubscribedTo } from '@/lib/platformConfig';
 import type { OutboundChannel } from '@/lib/types';
 
 interface RoiPayload {
@@ -12,6 +15,12 @@ interface RoiPayload {
   waitSeconds?: number;
 }
 
+/**
+ * Compose an outgoing records request. Event-first: this route resolves the
+ * chase plan and creates the case, then emits `case.created` — the subscribed
+ * chasing agent sends rung 1 (incl. Care Everywhere) on its first turn inside
+ * the inline pump. No outbound_attempt is created here.
+ */
 export async function POST(req: NextRequest) {
   let payload: RoiPayload;
   try {
@@ -63,15 +72,13 @@ export async function POST(req: NextRequest) {
 
   const p = patient as { id: string; first_name: string; last_name: string; dob: string; mrn: string };
 
-  // Fetch Records Chaser agent config for chase_policy fallback
-  const { data: agentRow } = await sb
-    .from('agents')
-    .select('config')
-    .eq('name', 'Records Chaser')
-    .single();
-  const agentConfig = (agentRow as { config: Record<string, unknown> } | null)?.config ?? {};
+  // Resolve the chasing agent BY SUBSCRIPTION (case.created on
+  // records_request_out), not by name. Null-safe: no agent → plan from
+  // org/defaults only.
+  const chaser = await findAgentSubscribedTo('case.created', 'records_request_out');
+  const agentConfig = chaser?.config ?? {};
 
-  // Build channel plan (new step-based shape)
+  // Build channel plan (step-based shape): org + agent config + form override
   const plan = buildChannelPlan(
     {
       channels: orgChannels,
@@ -81,10 +88,6 @@ export async function POST(req: NextRequest) {
     payload.channel as import('@/lib/outbound').Channel | undefined,
     payload.waitSeconds,
   );
-
-  const firstStep = plan.steps[0];
-  const firstChannel = firstStep.channel as OutboundChannel;
-  const isCareEverywhere = firstChannel === 'care_everywhere';
 
   // Create work item in roi_outgoing
   const item = await createWorkItem({
@@ -102,14 +105,13 @@ export async function POST(req: NextRequest) {
     },
   });
 
-  // Set matched patient + agent_state with NEW step-based chase_plan
+  // Set matched patient + the resolved chase plan. No attempt_no — the chasing
+  // agent's ladder cursor starts at 0 and sends rung 1 itself.
   await sb
     .from('work_items')
     .update({
       matched_patient_id: payload.patientId,
       agent_state: {
-        attempt_no: 1,
-        last_channel: firstChannel,
         kind: 'records_request',
         chase_plan: {
           steps: plan.steps,
@@ -119,98 +121,44 @@ export async function POST(req: NextRequest) {
     })
     .eq('id', item.id);
 
-  // Render outbound document for first attempt
-  const outboundCtx: import('@/lib/outbound').OutboundContext = {
-    itemId: item.id,
-    patientName: `${p.first_name} ${p.last_name}`,
-    patientDob: p.dob,
-    patientMrn: p.mrn,
-    recordsRequested: payload.recordsRequested,
-    orgName,
-    orgFax: orgContact['fax'] as string | undefined,
-    orgEmail: orgContact['email'] as string | undefined,
-    orgPhone: orgContact['phone'] as string | undefined,
-    attemptNo: 1,
-  };
-  const rendered = renderOutboundDocument(
-    firstChannel as import('@/lib/outbound').Channel,
-    'records_request',
-    outboundCtx,
-  );
-
-  const contactSnapshot: Record<string, unknown> = {
-    fax: orgContact['fax'],
-    email: orgContact['email'],
-    phone: orgContact['phone'],
-  };
-
-  // care_everywhere: respond_after = now + 8s
-  // portal: respond_after = null (never auto-timed-out)
-  // others: use plan.waitSeconds
-  let respondAfter: string | null;
-  if (isCareEverywhere) {
-    respondAfter = new Date(Date.now() + 8000).toISOString();
-  } else if (firstChannel === 'portal') {
-    respondAfter = null;
-  } else {
-    respondAfter = new Date(Date.now() + plan.waitSeconds * 1000).toISOString();
-  }
-
-  const { data: attempt, error: aErr } = await sb
-    .from('outbound_attempts')
-    .insert({
-      work_item_id: item.id,
-      channel: firstChannel,
-      attempt_no: 1,
-      to_org_id: payload.orgId,
-      to_contact: contactSnapshot,
-      payload: {
-        subject: rendered.subject,
-        body: rendered.body,
-        document: rendered.document,
-        kind: 'records_request',
-      },
-      status: 'sent',
-      respond_after: respondAfter,
-    })
-    .select('id')
-    .single();
-
-  if (aErr) {
-    console.error('[roi.attempt_failed]', aErr.message);
-    return NextResponse.json({ error: 'Failed to create outbound attempt' }, { status: 500 });
-  }
-
-  // Set item to waiting
-  await sb
-    .from('work_items')
-    .update({ status: 'waiting' })
-    .eq('id', item.id);
-
-  // Audit log
+  // Audit: the human composed the request (the send is the agent's turn).
   await sb.from('audit_log').insert({
     work_item_id: item.id,
     actor: 'human',
-    action: `send_${firstChannel}`,
+    action: 'roi_composed',
     detail: {
-      attempt_id: (attempt as { id: string }).id,
-      channel: firstChannel,
       org_id: payload.orgId,
       records_requested: payload.recordsRequested,
       chase_plan: { steps: plan.steps, waitSeconds: plan.waitSeconds },
+      agent: chaser?.name ?? null,
     },
   });
+
+  // Event-first handoff: case.created wakes the subscribed chasing agent.
+  const event = await emitEvent({
+    type: 'case.created',
+    caseId: item.id,
+    payload: { case_type: 'records_request_out' },
+    actor: 'human',
+  });
+  if (!event) {
+    console.error('[roi.emit_failed]', JSON.stringify({ itemId: item.id }));
+    return NextResponse.json({ error: 'Failed to emit case.created' }, { status: 500 });
+  }
+
+  // Inline pump so rung 1 goes out before we respond.
+  const pump = await pumpEvents({ maxRounds: 2, deadlineMs: 5000 });
 
   console.log(
     '[roi.composed]',
     JSON.stringify({
       itemId: item.id,
       orgId: payload.orgId,
-      channel: firstChannel,
       waitSeconds: plan.waitSeconds,
       stepCount: plan.steps.length,
       steps: plan.steps.map((s) => `${s.channel}#${s.attempt}`).join(' → '),
-      attemptId: (attempt as { id: string }).id,
+      agent: chaser?.name ?? null,
+      turns: pump.turns,
     }),
   );
 
