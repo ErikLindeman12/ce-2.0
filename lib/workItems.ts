@@ -263,6 +263,8 @@ export async function listQueues(): Promise<WorkQueue[]> {
 
   return ((queuesRes.data ?? []) as WorkQueue[]).map((q) => ({
     ...q,
+    kind: q.kind ?? 'work',
+    config: q.config ?? {},
     item_count: counts[q.key] ?? 0,
   }));
 }

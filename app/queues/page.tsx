@@ -16,6 +16,7 @@ const QUEUE_THEMES: Record<string, QueueTheme> = {
   roi_incoming: { borderColor: '#8b5cf6', badgeClass: 'badge-accent',  countColor: '#7c3aed' },
   roi_outgoing: { borderColor: 'var(--color-warning)', badgeClass: 'badge-warning', countColor: 'var(--color-warning)' },
   human_review: { borderColor: '#f97316', badgeClass: 'badge-warning', countColor: '#ea580c' },
+  prior_auth:   { borderColor: '#0891b2', badgeClass: 'badge-info',    countColor: '#0e7490' },
 };
 
 const DEFAULT_THEME: QueueTheme = {
@@ -62,6 +63,7 @@ const SCENARIOS: Array<{ key: string; label: string }> = [
   { key: 'call_referral',         label: '📞 Call: referral' },
   { key: 'call_records_request',  label: '📞 Call: records request' },
   { key: 'fax_referral_partial',  label: 'Fax: partial/fuzzy match' },
+  { key: 'fax_prior_auth',        label: '📑 Prior auth fax' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -341,7 +343,9 @@ export default function QueuesPage() {
       >
         {queues.map((q) => {
           const theme = themeFor(q.key);
-          const isHumanReview = q.key === 'human_review';
+          // 'review'-kind queues get the needs-attention treatment; fall back to
+          // the legacy key check when kind is absent (older API responses).
+          const isHumanReview = q.kind ? q.kind === 'review' : q.key === 'human_review';
           return (
             <a
               key={q.key}

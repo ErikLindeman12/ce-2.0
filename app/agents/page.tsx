@@ -25,6 +25,19 @@ interface ChasePolicyConfig {
 
 interface AgentConfig {
   chase_policy?: ChasePolicyConfig;
+  [key: string]: unknown; // requirements / send_policy / complete_when / classify_rules …
+}
+
+// Event subscription — matches lib/types.ts AgentSubscription (frozen)
+interface AgentSubscription {
+  event_type: string;
+  filter?: Record<string, unknown>;
+  on_event?: Record<string, unknown>; // never edited here — round-tripped verbatim
+}
+
+interface EventTypeOption {
+  type: string;
+  description?: string;
 }
 
 interface Agent {
@@ -40,6 +53,8 @@ interface Agent {
   model: string;
   mode?: AgentMode;
   config?: AgentConfig;
+  subscriptions: AgentSubscription[];
+  owner: string | null;
   createdAt?: string;
   created_at?: string;
 }
@@ -67,13 +82,90 @@ function normalizeAgent(a: Record<string, unknown>): Agent {
     model: (a.model as string) ?? 'heuristic',
     mode: ((a.mode as AgentMode | undefined) ?? 'autonomous'),
     config: (a.config as AgentConfig | undefined) ?? {},
+    subscriptions: (a.subscriptions as AgentSubscription[] | undefined) ?? [],
+    owner: (a.owner as string | null | undefined) ?? null,
     createdAt: (a.createdAt ?? a.created_at) as string | undefined,
     created_at: (a.created_at ?? a.createdAt) as string | undefined,
   };
 }
 
 // ---------------------------------------------------------------------------
-// Escalation ladder editor (roi_outgoing agents only)
+// Subscription <-> form-row helpers
+// ---------------------------------------------------------------------------
+
+interface FilterPair {
+  key: string;
+  value: string;
+  /** Original (possibly non-string) value — kept so unchanged pairs round-trip exactly. */
+  original?: unknown;
+}
+
+interface SubRow {
+  event_type: string;
+  filterPairs: FilterPair[]; // up to 3
+  on_event?: Record<string, unknown>; // preserved verbatim, never rendered
+}
+
+function filterValueText(v: unknown): string {
+  return typeof v === 'string' ? v : JSON.stringify(v);
+}
+
+/** Loose-parse a typed filter value: booleans/numbers become typed, rest stays string. */
+function parseLooseValue(text: string): unknown {
+  const t = text.trim();
+  if (t === 'true') return true;
+  if (t === 'false') return false;
+  if (t !== '' && /^-?\d+(\.\d+)?$/.test(t)) return Number(t);
+  return t;
+}
+
+function subToRow(s: AgentSubscription): SubRow {
+  return {
+    event_type: s.event_type,
+    filterPairs: Object.entries(s.filter ?? {}).map(([key, v]) => ({
+      key,
+      value: filterValueText(v),
+      original: v,
+    })),
+    on_event: s.on_event,
+  };
+}
+
+function rowToSub(row: SubRow): AgentSubscription {
+  const filter: Record<string, unknown> = {};
+  for (const p of row.filterPairs) {
+    const k = p.key.trim();
+    if (!k) continue;
+    // Unchanged pairs keep their original (possibly non-string) value exactly.
+    filter[k] =
+      p.original !== undefined && filterValueText(p.original) === p.value
+        ? p.original
+        : parseLooseValue(p.value);
+  }
+  const sub: AgentSubscription = { event_type: row.event_type };
+  if (Object.keys(filter).length > 0) sub.filter = filter;
+  if (row.on_event !== undefined) sub.on_event = row.on_event;
+  return sub;
+}
+
+function subChipLabel(s: AgentSubscription): string {
+  const filterParts = Object.entries(s.filter ?? {})
+    .map(([k, v]) => ` · ${k}=${filterValueText(v)}`)
+    .join('');
+  return `${s.event_type}${filterParts}`;
+}
+
+// Fallback for the trigger dropdown if /api/event-types is unreachable
+const FALLBACK_EVENT_TYPES = [
+  'document.received',
+  'document.classified',
+  'case.created',
+  'response.received',
+  'attempt.timed_out',
+];
+
+// ---------------------------------------------------------------------------
+// Escalation ladder editor (agents with a chase_policy)
 // ---------------------------------------------------------------------------
 
 const LADDER_CHANNELS: Array<{ value: string; label: string; icon: string }> = [
@@ -90,11 +182,14 @@ function ladderReadout(steps: string[], waitSeconds: number): string {
 
 function EscalationLadderEditor({
   agentId,
+  baseConfig,
   initialSteps,
   initialWaitSeconds,
   onSaved,
 }: {
   agentId: string;
+  /** Full current agent.config — config is replaced wholesale on PATCH, so we merge. */
+  baseConfig: AgentConfig;
   initialSteps: string[];
   initialWaitSeconds: number;
   onSaved: () => void;
@@ -131,8 +226,15 @@ function EscalationLadderEditor({
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          // config is a wholesale-replace jsonb — merge so other named policies
+          // (requirements / send_policy / complete_when …) survive a ladder save.
           config: {
-            chase_policy: { steps, waitSeconds: waitSecs },
+            ...baseConfig,
+            chase_policy: {
+              ...(baseConfig.chase_policy as Record<string, unknown> | undefined),
+              steps,
+              waitSeconds: waitSecs,
+            },
           },
         }),
       });
@@ -305,14 +407,13 @@ const ALL_TOOLS = [
   'extract_fields',
   'match_patient',
   'verify_requirements',
-  'advance_stage',
   'send_fax',
   'send_email',
   'send_sms',
   'place_call',
+  'send_voice',
+  'send_care_everywhere',
   'request_more_info',
-  'mark_complete',
-  'escalate_to_human',
 ];
 
 const QUEUE_KEYS = ['intake', 'referrals', 'roi_incoming', 'roi_outgoing', 'human_review'];
@@ -335,6 +436,8 @@ interface AgentForm {
   model: string;
   enabled: boolean;
   mode: AgentMode;
+  subs: SubRow[];
+  configText: string; // Advanced policies (JSON) — validated on save
 }
 
 function blankForm(): AgentForm {
@@ -347,6 +450,8 @@ function blankForm(): AgentForm {
     model: 'heuristic',
     enabled: true,
     mode: 'autonomous',
+    subs: [],
+    configText: '{}',
   };
 }
 
@@ -360,6 +465,8 @@ function agentToForm(a: Agent): AgentForm {
     model: a.model,
     enabled: a.enabled,
     mode: a.mode ?? 'autonomous',
+    subs: (a.subscriptions ?? []).map(subToRow),
+    configText: JSON.stringify(a.config ?? {}, null, 2),
   };
 }
 
@@ -422,6 +529,20 @@ export default function AgentsPage() {
   // Which agent's ladder editor is open (by agent id; null = none)
   const [openLadderAgentId, setOpenLadderAgentId] = useState<string | null>(null);
 
+  // Event taxonomy for trigger dropdowns
+  const [eventTypes, setEventTypes] = useState<EventTypeOption[]>([]);
+
+  // "Fire sample event" per-trigger-row state (keyed by row index)
+  const [fireNotes, setFireNotes] = useState<Record<number, string>>({});
+  const [firingRow, setFiringRow] = useState<number | null>(null);
+
+  // Inline "▶ replayed N shadowed decisions" note after a shadow→live flip
+  const [modeReplayNote, setModeReplayNote] = useState<{ agentId: string; count: number } | null>(null);
+
+  // Advanced policies (JSON) collapsible + validation error
+  const [showPolicyJson, setShowPolicyJson] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
+
   // ---------------------------------------------------------------------------
   // Load
   // ---------------------------------------------------------------------------
@@ -455,6 +576,17 @@ export default function AgentsPage() {
     } finally {
       setLoading(false);
     }
+
+    // Event taxonomy — non-fatal if unavailable (dropdown falls back)
+    try {
+      const res = await fetch('/api/event-types', { cache: 'no-store' });
+      if (res.ok) {
+        const body = (await res.json()) as { data?: EventTypeOption[] };
+        if (Array.isArray(body.data)) setEventTypes(body.data);
+      }
+    } catch {
+      /* dropdown uses FALLBACK_EVENT_TYPES */
+    }
   }, []);
 
   useEffect(() => {
@@ -484,11 +616,19 @@ export default function AgentsPage() {
     const id = agent.id;
     setPatchingMode((prev) => new Set(prev).add(id));
     try {
-      await fetch(`/api/agents/${id}`, {
+      const res = await fetch(`/api/agents/${id}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ mode }),
       });
+      // shadow→live flips re-run shadowed deliveries; surface the replay count
+      const body = (await res.json().catch(() => ({}))) as { replayed?: number };
+      if (res.ok && typeof body.replayed === 'number' && body.replayed > 0) {
+        setModeReplayNote({ agentId: id, count: body.replayed });
+        setTimeout(() => {
+          setModeReplayNote((cur) => (cur?.agentId === id ? null : cur));
+        }, 8000);
+      }
       void load();
     } finally {
       setPatchingMode((prev) => {
@@ -531,6 +671,9 @@ export default function AgentsPage() {
     setForm(blankForm());
     setSaveError(null);
     setSaveSuccess(null);
+    setConfigError(null);
+    setFireNotes({});
+    setShowPolicyJson(false);
     setShowForm(true);
   }
 
@@ -539,6 +682,9 @@ export default function AgentsPage() {
     setForm(agentToForm(agent));
     setSaveError(null);
     setSaveSuccess(null);
+    setConfigError(null);
+    setFireNotes({});
+    setShowPolicyJson(false);
     setShowForm(true);
   }
 
@@ -549,6 +695,21 @@ export default function AgentsPage() {
   async function handleSave(e: React.FormEvent) {
     e.preventDefault();
     if (!form.name.trim()) return;
+
+    // Validate Advanced policies JSON before anything else — bad JSON never saves.
+    let config: Record<string, unknown>;
+    try {
+      const parsed: unknown = JSON.parse(form.configText.trim() || '{}');
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('must be a JSON object');
+      }
+      config = parsed as Record<string, unknown>;
+      setConfigError(null);
+    } catch (err) {
+      setConfigError(`Invalid policies JSON — ${err instanceof Error ? err.message : String(err)}`);
+      setShowPolicyJson(true);
+      return;
+    }
 
     setSaving(true);
     setSaveError(null);
@@ -563,6 +724,8 @@ export default function AgentsPage() {
       model: form.model,
       enabled: form.enabled,
       mode: form.mode,
+      config,
+      subscriptions: form.subs.map(rowToSub),
     };
 
     try {
@@ -573,11 +736,15 @@ export default function AgentsPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
-      const body = (await res.json()) as { error?: string };
+      const body = (await res.json()) as { error?: string; replayed?: number };
       if (!res.ok) {
         setSaveError(body.error ?? 'Failed to save agent');
       } else {
-        setSaveSuccess(editingId ? 'Agent updated' : 'Agent created');
+        const replayNote =
+          typeof body.replayed === 'number' && body.replayed > 0
+            ? ` — ▶ replayed ${body.replayed} shadowed decision${body.replayed === 1 ? '' : 's'}`
+            : '';
+        setSaveSuccess((editingId ? 'Agent updated' : 'Agent created') + replayNote);
         setShowForm(false);
         void load();
       }
@@ -599,6 +766,98 @@ export default function AgentsPage() {
         ? prev.tools.filter((t) => t !== tool)
         : [...prev.tools, tool],
     }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Trigger (subscription) row mutators
+  // ---------------------------------------------------------------------------
+
+  const eventTypeOptions: EventTypeOption[] =
+    eventTypes.length > 0 ? eventTypes : FALLBACK_EVENT_TYPES.map((t) => ({ type: t }));
+
+  function addSubRow() {
+    const defaultType = eventTypeOptions[0]?.type ?? 'document.received';
+    setFireNotes({});
+    setForm((prev) => ({
+      ...prev,
+      subs: [...prev.subs, { event_type: defaultType, filterPairs: [] }],
+    }));
+  }
+
+  function removeSubRow(idx: number) {
+    setFireNotes({});
+    setForm((prev) => ({ ...prev, subs: prev.subs.filter((_, i) => i !== idx) }));
+  }
+
+  function updateSubRow(idx: number, patch: Partial<SubRow>) {
+    setForm((prev) => ({
+      ...prev,
+      subs: prev.subs.map((row, i) => (i === idx ? { ...row, ...patch } : row)),
+    }));
+  }
+
+  function updateFilterPair(idx: number, pairIdx: number, patch: Partial<FilterPair>) {
+    setForm((prev) => ({
+      ...prev,
+      subs: prev.subs.map((row, i) =>
+        i === idx
+          ? { ...row, filterPairs: row.filterPairs.map((p, pi) => (pi === pairIdx ? { ...p, ...patch } : p)) }
+          : row,
+      ),
+    }));
+  }
+
+  function addFilterPair(idx: number) {
+    setForm((prev) => ({
+      ...prev,
+      subs: prev.subs.map((row, i) =>
+        i === idx && row.filterPairs.length < 3
+          ? { ...row, filterPairs: [...row.filterPairs, { key: '', value: '' }] }
+          : row,
+      ),
+    }));
+  }
+
+  function removeFilterPair(idx: number, pairIdx: number) {
+    setForm((prev) => ({
+      ...prev,
+      subs: prev.subs.map((row, i) =>
+        i === idx ? { ...row, filterPairs: row.filterPairs.filter((_, pi) => pi !== pairIdx) } : row,
+      ),
+    }));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Fire a sample event (replays the latest event of this type)
+  // ---------------------------------------------------------------------------
+
+  async function fireSample(eventType: string, rowIdx: number) {
+    setFiringRow(rowIdx);
+    setFireNotes((prev) => ({ ...prev, [rowIdx]: '' }));
+    let note: string;
+    try {
+      const res = await fetch('/api/events', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ replayType: eventType }),
+      });
+      const body = (await res.json().catch(() => null)) as
+        | { data?: { turns?: number }; error?: { message?: string } }
+        | null;
+      if (res.status === 404 || (res.ok && !body?.data)) {
+        note = 'no prior event of this type';
+      } else if (!res.ok) {
+        note = body?.error?.message ?? 'failed to fire event';
+      } else {
+        const turns = body?.data?.turns ?? 0;
+        note = `⚡ replayed — ${turns} agent turn${turns === 1 ? '' : 's'} ran`;
+      }
+    } catch (e) {
+      note = e instanceof Error ? e.message : 'network error';
+    } finally {
+      setFiringRow(null);
+    }
+    setFireNotes((prev) => ({ ...prev, [rowIdx]: note }));
   }
 
   // ---------------------------------------------------------------------------
@@ -671,9 +930,10 @@ export default function AgentsPage() {
           const currentMode: AgentMode = agent.mode ?? 'autonomous';
           const modePatching = patchingMode.has(agent.id);
           const stats = agentStats[agent.id] ?? null;
-          const isRoiOutgoing = queueKey === 'roi_outgoing';
+          const hasChasePolicy = Boolean(agent.config?.chase_policy);
           const chasePolicy = agent.config?.chase_policy;
           const showLadderEditor = openLadderAgentId === agent.id;
+          const subs = agent.subscriptions ?? [];
 
           return (
             <div key={agent.id} style={{
@@ -686,18 +946,26 @@ export default function AgentsPage() {
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: '16px' }}>
                 <div style={{ flex: 1 }}>
                   {/* Name row */}
-                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px', flexWrap: 'wrap' }}>
                     <span style={{ fontWeight: 700, fontSize: '1rem' }}>{agent.name}</span>
-                    <span style={{
-                      padding: '2px 8px',
-                      borderRadius: '99px',
-                      fontSize: '0.72rem',
-                      fontWeight: 600,
-                      background: '#ede9fe',
-                      color: '#6d28d9',
-                    }}>
-                      {queueName(queueKey)}
-                    </span>
+                    {subs.length > 0 ? (
+                      subs.map((s, i) => (
+                        <span key={i} className="agent-sub-chip" title={s.on_event ? 'Has on_event effects' : undefined}>
+                          ⚡ {subChipLabel(s)}
+                        </span>
+                      ))
+                    ) : (
+                      <span style={{
+                        padding: '2px 8px',
+                        borderRadius: '99px',
+                        fontSize: '0.72rem',
+                        fontWeight: 600,
+                        background: '#ede9fe',
+                        color: '#6d28d9',
+                      }}>
+                        {queueName(queueKey)}
+                      </span>
+                    )}
                     <span style={{
                       padding: '2px 8px',
                       borderRadius: '99px',
@@ -744,6 +1012,23 @@ export default function AgentsPage() {
                         );
                       })}
                     </div>
+                    {modeReplayNote?.agentId === agent.id && (
+                      <div style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: '6px',
+                        marginLeft: '10px',
+                        padding: '3px 10px',
+                        background: '#d1fae5',
+                        border: '1px solid #6ee7b7',
+                        borderRadius: '99px',
+                        fontSize: '0.74rem',
+                        fontWeight: 700,
+                        color: '#065f46',
+                      }}>
+                        ▶ replayed {modeReplayNote.count} shadowed decision{modeReplayNote.count === 1 ? '' : 's'}
+                      </div>
+                    )}
                   </div>
 
                   {/* Mini stats strip */}
@@ -796,8 +1081,8 @@ export default function AgentsPage() {
                     </div>
                   )}
 
-                  {/* Escalation ladder readout + editor — roi_outgoing agents only */}
-                  {isRoiOutgoing && (
+                  {/* Escalation ladder readout + editor — agents with a chase_policy */}
+                  {hasChasePolicy && (
                     <div style={{ marginTop: '8px' }}>
                       <div style={{ display: 'flex', alignItems: 'center', gap: '10px', flexWrap: 'wrap' }}>
                         <span style={{ fontSize: '0.78rem', fontWeight: 700, color: 'var(--color-ink-muted)' }}>
@@ -832,6 +1117,7 @@ export default function AgentsPage() {
                       {showLadderEditor && (
                         <EscalationLadderEditor
                           agentId={agent.id}
+                          baseConfig={agent.config ?? {}}
                           initialSteps={chasePolicy?.steps ?? []}
                           initialWaitSeconds={chasePolicy?.waitSeconds ?? 30}
                           onSaved={() => { void load(); setOpenLadderAgentId(null); }}
@@ -926,22 +1212,6 @@ export default function AgentsPage() {
               />
             </div>
 
-            {/* Queue select */}
-            <div style={fieldGroup}>
-              <label style={labelStyle}>Queue</label>
-              <select
-                value={form.queueKey}
-                onChange={(e) => setForm((f) => ({ ...f, queueKey: e.target.value }))}
-                style={selectStyle}
-              >
-                {(queues.length > 0 ? queues.map((q) => q.key) : QUEUE_KEYS).map((key) => (
-                  <option key={key} value={key}>
-                    {queues.find((q) => q.key === key)?.name ?? key}
-                  </option>
-                ))}
-              </select>
-            </div>
-
             {/* Instructions */}
             <div style={fieldGroup}>
               <label style={labelStyle}>Instructions</label>
@@ -952,6 +1222,163 @@ export default function AgentsPage() {
                 rows={4}
                 style={{ ...inputStyle, resize: 'vertical' }}
               />
+            </div>
+
+            {/* Triggers — event subscriptions */}
+            <div style={fieldGroup}>
+              <label style={labelStyle}>Triggers</label>
+              <div style={{ fontSize: '0.75rem', color: '#6b7280', marginTop: '-2px' }}>
+                Wake this agent when an event fires. Filters are equality matches on the event payload
+                (plus <code style={{ fontSize: '0.72rem' }}>case_type</code> / <code style={{ fontSize: '0.72rem' }}>source_channel</code>).
+              </div>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                {form.subs.length === 0 && (
+                  <div style={{ fontSize: '0.78rem', color: '#9ca3af', fontStyle: 'italic', padding: '4px 0' }}>
+                    No triggers — this agent never wakes on events.
+                  </div>
+                )}
+                {form.subs.map((row, idx) => (
+                  <div key={idx} className="trigger-row">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                      <span aria-hidden="true">⚡</span>
+                      <select
+                        value={row.event_type}
+                        onChange={(e) => updateSubRow(idx, { event_type: e.target.value })}
+                        style={{ ...selectStyle, width: 'auto', minWidth: '220px', padding: '6px 10px', fontSize: '0.82rem' }}
+                      >
+                        {!eventTypeOptions.some((t) => t.type === row.event_type) && (
+                          <option value={row.event_type}>{row.event_type}</option>
+                        )}
+                        {eventTypeOptions.map((t) => (
+                          <option key={t.type} value={t.type} title={t.description}>{t.type}</option>
+                        ))}
+                      </select>
+                      {row.on_event !== undefined && (
+                        <span
+                          className="trigger-on-event-badge"
+                          title="This trigger has on_event effects — preserved verbatim on save"
+                        >
+                          on_event ✓
+                        </span>
+                      )}
+                      {editingId && (
+                        <button
+                          type="button"
+                          onClick={() => void fireSample(row.event_type, idx)}
+                          disabled={firingRow !== null}
+                          title="Re-fire the latest event of this type through the engine"
+                          style={{
+                            padding: '5px 10px',
+                            background: firingRow === idx ? '#f3f4f6' : '#eef2ff',
+                            color: firingRow === idx ? '#9ca3af' : '#3730a3',
+                            border: '1px solid #c7d2fe',
+                            borderRadius: '6px',
+                            fontSize: '0.74rem',
+                            fontWeight: 700,
+                            cursor: firingRow !== null ? 'default' : 'pointer',
+                          }}
+                        >
+                          {firingRow === idx ? 'Firing…' : '⚡ Fire sample'}
+                        </button>
+                      )}
+                      <button
+                        type="button"
+                        onClick={() => removeSubRow(idx)}
+                        title="Remove trigger"
+                        style={{
+                          marginLeft: 'auto',
+                          background: 'none',
+                          border: 'none',
+                          cursor: 'pointer',
+                          color: '#dc2626',
+                          fontSize: '1rem',
+                          fontWeight: 700,
+                          lineHeight: 1,
+                          padding: '0 4px',
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+
+                    {/* Filter key/value pairs (max 3) */}
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '4px' }}>
+                      {row.filterPairs.map((p, pi) => (
+                        <div key={pi} style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                          <span style={{ fontSize: '0.72rem', color: '#9ca3af', width: '38px', textAlign: 'right' }}>
+                            {pi === 0 ? 'when' : 'and'}
+                          </span>
+                          <input
+                            className="trigger-filter-input"
+                            placeholder="key (e.g. as)"
+                            value={p.key}
+                            onChange={(e) => updateFilterPair(idx, pi, { key: e.target.value })}
+                          />
+                          <span style={{ fontSize: '0.78rem', color: '#9ca3af' }}>=</span>
+                          <input
+                            className="trigger-filter-input"
+                            placeholder="value (e.g. referral)"
+                            value={p.value}
+                            onChange={(e) => updateFilterPair(idx, pi, { value: e.target.value })}
+                          />
+                          <button
+                            type="button"
+                            onClick={() => removeFilterPair(idx, pi)}
+                            title="Remove filter"
+                            style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#9ca3af', fontSize: '0.84rem', padding: '0 2px' }}
+                          >
+                            ×
+                          </button>
+                        </div>
+                      ))}
+                      {row.filterPairs.length < 3 && (
+                        <button
+                          type="button"
+                          onClick={() => addFilterPair(idx)}
+                          style={{
+                            alignSelf: 'flex-start',
+                            marginLeft: '44px',
+                            background: 'none',
+                            border: 'none',
+                            cursor: 'pointer',
+                            color: '#4f46e5',
+                            fontSize: '0.74rem',
+                            fontWeight: 600,
+                            padding: 0,
+                            textDecoration: 'underline',
+                            textUnderlineOffset: '2px',
+                          }}
+                        >
+                          + filter
+                        </button>
+                      )}
+                    </div>
+
+                    {fireNotes[idx] && (
+                      <div style={{ fontSize: '0.76rem', fontWeight: 600, color: fireNotes[idx].startsWith('⚡') ? '#065f46' : '#92400e' }}>
+                        {fireNotes[idx]}
+                      </div>
+                    )}
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={addSubRow}
+                  style={{
+                    alignSelf: 'flex-start',
+                    padding: '6px 12px',
+                    background: '#4f46e5',
+                    color: '#fff',
+                    border: 'none',
+                    borderRadius: '6px',
+                    fontSize: '0.78rem',
+                    fontWeight: 700,
+                    cursor: 'pointer',
+                  }}
+                >
+                  + Add trigger
+                </button>
+              </div>
             </div>
 
             {/* Tool checkboxes */}
@@ -983,6 +1410,52 @@ export default function AgentsPage() {
                   </label>
                 ))}
               </div>
+            </div>
+
+            {/* Advanced policies (JSON) — the low-code config DSL */}
+            <div style={fieldGroup}>
+              <button
+                type="button"
+                onClick={() => setShowPolicyJson((v) => !v)}
+                style={{
+                  background: 'none',
+                  border: 'none',
+                  cursor: 'pointer',
+                  textAlign: 'left',
+                  padding: 0,
+                  fontSize: '0.82rem',
+                  fontWeight: 700,
+                  color: '#374151',
+                }}
+              >
+                {showPolicyJson ? '▾' : '▸'} Advanced policies (JSON)
+              </button>
+              {showPolicyJson && (
+                <>
+                  <textarea
+                    value={form.configText}
+                    onChange={(e) => { setForm((f) => ({ ...f, configText: e.target.value })); setConfigError(null); }}
+                    rows={12}
+                    spellCheck={false}
+                    style={{ ...inputStyle, fontFamily: 'var(--font-mono)', fontSize: '0.76rem', resize: 'vertical', lineHeight: 1.5 }}
+                  />
+                  <div style={{ fontSize: '0.72rem', color: '#9ca3af' }}>
+                    Named policies: chase_policy · requirements · send_policy · complete_when · classify_rules. Validated on save.
+                  </div>
+                </>
+              )}
+              {configError && (
+                <div style={{
+                  background: '#fee2e2',
+                  border: '1px solid #fca5a5',
+                  borderRadius: '8px',
+                  padding: '8px 12px',
+                  color: '#991b1b',
+                  fontSize: '0.78rem',
+                }}>
+                  {configError}
+                </div>
+              )}
             </div>
 
             {/* Confidence threshold slider */}
@@ -1018,6 +1491,22 @@ export default function AgentsPage() {
               >
                 {MODELS.map((m) => (
                   <option key={m.value} value={m.value}>{m.label}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Legacy queue binding (demoted — superseded by triggers) */}
+            <div style={{ ...fieldGroup, maxWidth: '280px' }}>
+              <label style={{ ...labelStyle, fontSize: '0.72rem', color: '#9ca3af' }}>Legacy queue (compat)</label>
+              <select
+                value={form.queueKey}
+                onChange={(e) => setForm((f) => ({ ...f, queueKey: e.target.value }))}
+                style={{ ...selectStyle, padding: '6px 10px', fontSize: '0.8rem', color: '#6b7280' }}
+              >
+                {(queues.length > 0 ? queues.map((q) => q.key) : QUEUE_KEYS).map((key) => (
+                  <option key={key} value={key}>
+                    {queues.find((q) => q.key === key)?.name ?? key}
+                  </option>
                 ))}
               </select>
             </div>

@@ -110,6 +110,19 @@ W3 owners: builder agent (app/agents/page.tsx), queues agent (app/queues/*), ite
 
 ## 4. Engine invariants (every implementer must preserve)
 
+> **As-built amendments (E2E-verified):**
+> - **One rung per turn:** a tool that parks the case in `waiting` (sends,
+>   request_more_info) ends the turn — the next world event re-activates the
+>   agent. Without this a chase ladder fires every rung in one turn.
+> - **Review placement is a routing rule, not a view:** `review.requested →
+>   human_review` physically routes the case (Router-owned, still pure config);
+>   return-to-origin is derived from the case's `case.routed` history (latest
+>   non-review queue), NOT the creation-time snapshot — a review opened mid-turn
+>   races the same turn's classification routing.
+> - **`human.decided` re-activates the requesting agent** via a targeted
+>   delivery; an approved send + re-activation lets `complete_when` close the
+>   case in the same pump.
+
 1. Deliveries are at-least-once; external effects are idempotent (attempt dedupe_key) → effectively-once.
 2. One in-flight turn per case (assignee claim + claimed_at lease; sweep only releases stale AGENT claims, never 'human').
 3. Claim failure never consumes an event — delivery stays pending.

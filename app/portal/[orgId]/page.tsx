@@ -69,7 +69,7 @@ type StatusInfo = {
 function resolveStatus(req: PortalRequest): StatusInfo {
   const { status, queue_key } = req;
 
-  if (status === 'done') {
+  if (status === 'completed' || status === 'done') {
     const ch = req.response_channel ?? '';
     const chLabel =
       ch === 'care_everywhere' ? 'Care Everywhere' :
@@ -87,7 +87,7 @@ function resolveStatus(req: PortalRequest): StatusInfo {
     };
   }
 
-  if (queue_key === 'human_review' || status === 'human_review') {
+  if (status === 'under_review' || queue_key === 'human_review' || status === 'human_review') {
     return {
       label: 'Under review',
       bg: '#fef3c7',
@@ -464,7 +464,7 @@ function RequestCard({
       )}
 
       {/* Completed: view response document */}
-      {req.status === 'done' && req.response_document && (
+      {(req.status === 'completed' || req.status === 'done') && req.response_document && (
         <div style={{ marginTop: '6px' }}>
           <button
             onClick={() => setDocExpanded((v) => !v)}

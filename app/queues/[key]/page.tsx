@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { TimeAgo } from '@/app/components/TimeAgo';
-import type { WorkItem } from '@/lib/types';
+import type { WorkItem, WorkQueue, WorkQueueConfig } from '@/lib/types';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -30,6 +30,34 @@ interface AgentState {
 
 // WorkItem already includes agent_state; alias with a typed cast helper
 type WorkItemWithAgentState = WorkItem;
+
+/** One entry of a queue's config.columns (data-driven extra columns). */
+type QueueColumn = NonNullable<WorkQueueConfig['columns']>[number];
+
+// ---------------------------------------------------------------------------
+// Config-column path resolution: state.* → agent_state, extracted.* →
+// extracted_data, case.* → top-level item fields.
+// ---------------------------------------------------------------------------
+
+function resolveColumnPath(item: WorkItemWithAgentState, path: string): unknown {
+  const [root, ...rest] = path.split('.');
+  let cur: unknown =
+    root === 'state'     ? item.agent_state :
+    root === 'extracted' ? item.extracted_data :
+    root === 'case'      ? (item as unknown as Record<string, unknown>) :
+    undefined;
+  for (const seg of rest) {
+    if (cur && typeof cur === 'object') cur = (cur as Record<string, unknown>)[seg];
+    else return undefined;
+  }
+  return rest.length > 0 ? cur : undefined;
+}
+
+function formatColumnValue(v: unknown): string {
+  if (v === null || v === undefined || v === '') return '';
+  if (typeof v === 'object') return JSON.stringify(v);
+  return String(v);
+}
 
 // ---------------------------------------------------------------------------
 // Channel icons + labels
@@ -256,6 +284,27 @@ function ChannelSource({ channel }: { channel: string }) {
 }
 
 // ---------------------------------------------------------------------------
+// Review reason cell (shared by the human_review fallback + config columns)
+// ---------------------------------------------------------------------------
+
+function ReviewReasonCell({ reason }: { reason: string | null }) {
+  return (
+    <td style={{ maxWidth: '260px' }}>
+      {reason ? (
+        <div
+          className="badge badge-warning"
+          style={{ borderRadius: 'var(--radius-sm)', whiteSpace: 'normal', lineHeight: 1.4, padding: '4px 8px', display: 'block' }}
+        >
+          {reason}
+        </div>
+      ) : (
+        <span style={{ color: 'var(--color-ink-faint)' }}>—</span>
+      )}
+    </td>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Page
 // ---------------------------------------------------------------------------
 
@@ -263,6 +312,7 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
   const queueKey = params.key;
   const [items, setItems] = useState<WorkItemWithAgentState[]>([]);
   const [stale, setStale] = useState(false);
+  const [queueMeta, setQueueMeta] = useState<WorkQueue | null>(null);
 
   async function fetchItems() {
     try {
@@ -300,8 +350,26 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [queueKey]);
 
+  // Queue metadata (name/kind/config.columns) — one-shot per queue key.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await fetch('/api/queues', { cache: 'no-store' });
+        if (!res.ok) return;
+        const queues = (await res.json()) as WorkQueue[];
+        if (!cancelled) setQueueMeta(queues.find((q) => q.key === queueKey) ?? null);
+      } catch { /* fall back to hardcoded per-key behavior */ }
+    })();
+    return () => { cancelled = true; };
+  }, [queueKey]);
+
   const isOutgoing = queueKey === 'roi_outgoing';
-  const isHumanReview = queueKey === 'human_review';
+  const isHumanReview = queueKey === 'human_review' || queueMeta?.kind === 'review';
+
+  // Data-driven extra columns (builder-editable); null → hardcoded fallback.
+  const configColumns: QueueColumn[] | null =
+    queueMeta?.config?.columns?.length ? queueMeta.config.columns : null;
 
   const queueLabel: Record<string, string> = {
     intake:       'Intake',
@@ -323,7 +391,7 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
         </a>
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px', marginTop: '6px', flexWrap: 'wrap' }}>
           <h1 style={{ fontSize: '1.6rem', fontWeight: 800, margin: 0, color: 'var(--color-ink)' }}>
-            {queueLabel[queueKey] ?? queueKey}
+            {queueLabel[queueKey] ?? queueMeta?.name ?? queueKey}
           </h1>
           {isHumanReview && (
             <span className="badge badge-warning" style={{ fontSize: '0.78rem', padding: '4px 12px' }}>
@@ -383,8 +451,22 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
                 <th>Status</th>
                 <th>Confidence</th>
                 <th>Assignee</th>
-                {isOutgoing && <th>Chase Progress</th>}
-                {isHumanReview && <th>Review Reason</th>}
+                {configColumns ? (
+                  configColumns.map((c, i) => (
+                    <th key={`cfg-${i}`}>
+                      {c.type === 'field'
+                        ? c.label
+                        : c.type === 'chase_progress'
+                        ? 'Chase Progress'
+                        : 'Review Reason'}
+                    </th>
+                  ))
+                ) : (
+                  <>
+                    {isOutgoing && <th>Chase Progress</th>}
+                    {isHumanReview && <th>Review Reason</th>}
+                  </>
+                )}
               </tr>
             </thead>
             <tbody>
@@ -427,24 +509,34 @@ export default function QueueDetailPage({ params }: { params: { key: string } })
                   <td>
                     <AssigneeBadge assignee={item.assignee} />
                   </td>
-                  {isOutgoing && (
-                    <td>
-                      <ChaseProgress item={item} />
-                    </td>
-                  )}
-                  {isHumanReview && (
-                    <td style={{ maxWidth: '260px' }}>
-                      {item.review_reason ? (
-                        <div
-                          className="badge badge-warning"
-                          style={{ borderRadius: 'var(--radius-sm)', whiteSpace: 'normal', lineHeight: 1.4, padding: '4px 8px', display: 'block' }}
-                        >
-                          {item.review_reason}
-                        </div>
-                      ) : (
-                        <span style={{ color: 'var(--color-ink-faint)' }}>—</span>
+                  {configColumns ? (
+                    configColumns.map((c, i) => {
+                      if (c.type === 'chase_progress') {
+                        return (
+                          <td key={`cfg-${i}`}>
+                            <ChaseProgress item={item} />
+                          </td>
+                        );
+                      }
+                      if (c.type === 'review_reason') {
+                        return <ReviewReasonCell key={`cfg-${i}`} reason={item.review_reason} />;
+                      }
+                      const value = formatColumnValue(resolveColumnPath(item, c.path));
+                      return (
+                        <td key={`cfg-${i}`} style={{ fontSize: '0.84rem' }}>
+                          {value || <span style={{ color: 'var(--color-ink-faint)' }}>—</span>}
+                        </td>
+                      );
+                    })
+                  ) : (
+                    <>
+                      {isOutgoing && (
+                        <td>
+                          <ChaseProgress item={item} />
+                        </td>
                       )}
-                    </td>
+                      {isHumanReview && <ReviewReasonCell reason={item.review_reason} />}
+                    </>
                   )}
                 </tr>
               ))}

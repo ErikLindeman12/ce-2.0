@@ -2,6 +2,7 @@
 
 import { useEffect, useState, useCallback, useRef } from 'react';
 import { useParams, useRouter } from 'next/navigation';
+import { TimeAgo } from '@/app/components/TimeAgo';
 import type { WorkItem, AuditLogEntry, OutboundAttempt, Patient } from '@/lib/types';
 
 // ---------------------------------------------------------------------------
@@ -48,6 +49,27 @@ interface AgentState {
   pending_approval?: PendingApproval;
 }
 
+/** Camel-case review request as served by GET /api/work-items/[id]. */
+interface ReviewSummary {
+  id: string;
+  kind: 'approval' | 'question' | 'exception';
+  question: string;
+  proposal: Record<string, unknown> | null;
+  candidates: Record<string, unknown>[] | null;
+  status: 'pending' | 'answered' | 'void';
+  agentName?: string | null;
+  createdAt: string;
+}
+
+/** Camel-case case event as served by GET /api/work-items/[id] (newest first). */
+interface CaseEvent {
+  id: string;
+  type: string;
+  actor: string;
+  payload: Record<string, unknown>;
+  createdAt: string;
+}
+
 interface WorkItemDetail {
   item: WorkItem & {
     sourceText?: string;
@@ -60,6 +82,8 @@ interface WorkItemDetail {
   attempts: OutboundAttempt[];
   outboundAttempts?: OutboundAttempt[];
   patientCandidates: Patient[];
+  reviews?: ReviewSummary[];
+  events?: CaseEvent[];
 }
 
 // Attempts carry payload.document and richer response
@@ -639,6 +663,96 @@ function AuditTimeline({ audit }: { audit: AuditLogEntry[] }) {
 }
 
 // ---------------------------------------------------------------------------
+// Event timeline — the case's substrate events (newest first)
+// ---------------------------------------------------------------------------
+
+/** Compact one-line payload summary per event type, e.g. 'queue: referrals'. */
+function eventPayloadSummary(type: string, payload: Record<string, unknown>): string | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const p = payload;
+  switch (type) {
+    case 'case.routed':
+    case 'case.moved': {
+      const q = p['queue'] ?? p['to'];
+      return q ? `queue: ${String(q)}` : null;
+    }
+    case 'attempt.created':
+      return [p['channel'], p['kind']].filter(Boolean).map(String).join(' · ') || null;
+    case 'document.classified':
+      return p['as']
+        ? `as: ${String(p['as'])}${typeof p['confidence'] === 'number' ? ` · ${Math.round((p['confidence'] as number) * 100)}%` : ''}`
+        : null;
+    case 'patient.matched':
+      return typeof p['confidence'] === 'number'
+        ? `confidence ${Math.round((p['confidence'] as number) * 100)}%`
+        : null;
+    case 'fields.extracted':
+      return p['fieldCount'] !== undefined ? `${String(p['fieldCount'])} fields` : null;
+    case 'review.requested':
+      return p['kind'] ? String(p['kind']) : null;
+    case 'case.completed':
+      return p['result'] ? `result: ${String(p['result'])}` : null;
+    default: {
+      const parts = Object.entries(p)
+        .filter(([, v]) => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean')
+        .slice(0, 3)
+        .map(([k, v]) => `${k}: ${String(v).slice(0, 40)}`);
+      return parts.length > 0 ? parts.join(' · ') : null;
+    }
+  }
+}
+
+function EventTimeline({ events }: { events: CaseEvent[] }) {
+  if (events.length === 0) {
+    return (
+      <div style={{ color: 'var(--color-ink-faint)', fontSize: '0.82rem' }}>
+        No events yet.
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ maxHeight: '380px', overflowY: 'auto' }}>
+      {events.map((ev) => {
+        const isAgent = ev.actor.startsWith('agent:');
+        const isPortal = ev.actor.startsWith('portal:');
+        const isHuman = ev.actor === 'human' || ev.actor.startsWith('human(');
+        const actorLabel = isAgent
+          ? ev.actor.replace('agent:', '')
+          : isPortal
+          ? ev.actor.replace('portal:', '')
+          : ev.actor;
+        const badgeClass = isAgent
+          ? 'badge-accent'
+          : isPortal
+          ? 'badge-portal'
+          : isHuman
+          ? 'badge-success'
+          : 'badge-neutral';
+        const summary = eventPayloadSummary(ev.type, ev.payload ?? {});
+
+        return (
+          <div key={ev.id} className="event-row">
+            <span className="event-type-badge">{ev.type}</span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                <span className={`badge ${badgeClass}`} style={{ fontSize: '0.68rem' }}>
+                  {actorLabel}
+                </span>
+                <span style={{ fontSize: '0.72rem', color: 'var(--color-ink-faint)', marginLeft: 'auto', whiteSpace: 'nowrap' }}>
+                  <TimeAgo iso={ev.createdAt} />
+                </span>
+              </div>
+              {summary && <div className="event-payload-summary">{summary}</div>}
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Button helper
 // ---------------------------------------------------------------------------
 
@@ -1148,7 +1262,18 @@ export default function WorkItemDetailPage() {
         audit:             aliasKeys((raw['audit']            ?? raw['auditTrail']       ?? [])) as AuditLogEntry[],
         attempts:          aliasKeys((raw['attempts']         ?? raw['outboundAttempts'] ?? [])) as OutboundAttempt[],
         patientCandidates: aliasKeys((raw['patientCandidates'] ?? [])) as Patient[],
+        reviews: (raw['reviews'] ?? []) as ReviewSummary[],
+        events:  (raw['events']  ?? []) as CaseEvent[],
       };
+      // Review banner text: when the case carries a pending question/exception
+      // review but no legacy review_reason, surface the review's question.
+      const pendingNonApproval = (data.reviews ?? []).find(
+        (r) => r.status === 'pending' && r.kind !== 'approval',
+      );
+      if (pendingNonApproval?.question && !data.item.review_reason) {
+        data.item.review_reason = pendingNonApproval.question;
+        (data.item as unknown as Record<string, unknown>)['reviewReason'] = pendingNonApproval.question;
+      }
       setDetail(data);
       setError(null);
     } catch (e) {
@@ -1220,7 +1345,14 @@ export default function WorkItemDetailPage() {
   }
 
   const { item, audit, attempts, patientCandidates } = detail;
-  const isHumanReview = item.queue_key === 'human_review';
+  const events = detail.events ?? [];
+  // Review mode: the human_review queue, OR a pending question/exception review
+  // on the case (cases may carry reviews while sitting in their home queue;
+  // pending approvals keep the standard view + ApprovalBanner).
+  const pendingReview = (detail.reviews ?? []).find(
+    (r) => r.status === 'pending' && r.kind !== 'approval',
+  );
+  const isHumanReview = item.queue_key === 'human_review' || !!pendingReview;
   const isOutbound = item.type === 'records_request_out';
   // Workbench mode: human_review queue AND not outbound (intake escalations only)
   const isIntakeWorkbench = isHumanReview && !isOutbound;
@@ -1501,6 +1633,12 @@ export default function WorkItemDetailPage() {
                 <AuditTimeline audit={audit} />
               </section>
 
+              {/* Event timeline — substrate events for this case */}
+              <section className="card">
+                <div className="section-label">Event Timeline</div>
+                <EventTimeline events={events} />
+              </section>
+
               {/* Outbound attempts */}
               {typedAttempts.length > 0 ? (
                 <section className="card">
@@ -1663,12 +1801,18 @@ export default function WorkItemDetailPage() {
         )}
       </section>
 
-      {/* Audit timeline — always shown below workbench too */}
+      {/* Audit + event timelines — always shown below workbench too */}
       {isIntakeWorkbench && (
-        <section className="card" style={{ marginTop: '20px' }}>
-          <div className="section-label">Audit Timeline</div>
-          <AuditTimeline audit={audit} />
-        </section>
+        <>
+          <section className="card" style={{ marginTop: '20px' }}>
+            <div className="section-label">Audit Timeline</div>
+            <AuditTimeline audit={audit} />
+          </section>
+          <section className="card" style={{ marginTop: '20px' }}>
+            <div className="section-label">Event Timeline</div>
+            <EventTimeline events={events} />
+          </section>
+        </>
       )}
     </div>
   );
