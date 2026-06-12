@@ -1,20 +1,42 @@
 /**
- * lib/tools.ts — shared tool registry.
+ * lib/tools.ts — shared tool registry (event substrate).
  *
  * TOOLS: Record<string, ToolDef> — every tool humans AND agents invoke.
- * runTool(name, workItemId, params, actor) — validates, executes, audits.
+ * runTool(name, workItemId, params, actor, ctx?) — validates, executes, audits.
  *
- * Every execution writes an audit_log row with actor, action, detail
- * (params + result + confidence).
+ * Substrate contract (docs/substrate-spec.md §3):
+ * - Every ToolDef carries effect: 'annotate' | 'external'.
+ * - Tools AUTO-EMIT events (causedBy ctx.event, actor preserved):
+ *     classify_document → document.classified {as, confidence}
+ *     extract_fields    → fields.extracted {fieldCount}
+ *     match_patient     → patient.matched {patientId, confidence} (on success)
+ *     send_* / request_more_info → attempt.created {attemptId, channel, kind}
+ * - All agent_state writes go through mergeCaseState (versioned).
+ * - External sends are idempotent via outbound_attempts.dedupe_key
+ *   (`${deliveryId}:${tool}:${attemptNo}`) — unique conflict returns the
+ *   existing attempt as success without re-writing state.
+ * - Engine code never references workflow-specific queue/type literals.
  */
 
 import { getSupabase } from './supabase';
 import { renderOutboundDocument, type Channel, type DocumentKind } from './outbound';
-import { matchPatientHeuristic } from './llm';
-import type { ToolDef, ToolResult, OutboundChannel } from './types';
+import { classifyHeuristic } from './llm';
+import { emitEvent } from './events';
+import { mergeCaseState, readCasePath } from './caseState';
+import { createReviewRequest, answerReview, findPendingReview } from './reviews';
+import type {
+  OutboundAttemptKind,
+  OutboundChannel,
+  Pred,
+  RequirementSpec,
+  ToolCtx,
+  ToolDef,
+  ToolResult,
+  WorkItem,
+} from './types';
 
 // ---------------------------------------------------------------------------
-// Utility: write audit log
+// Utility: write audit log (every runTool call lands here, with turn linkage)
 // ---------------------------------------------------------------------------
 
 async function audit(
@@ -22,10 +44,18 @@ async function audit(
   actor: string,
   action: string,
   detail: Record<string, unknown>,
+  ctx?: ToolCtx,
 ): Promise<void> {
   const { error } = await getSupabase()
     .from('audit_log')
-    .insert({ work_item_id: workItemId, actor, action, detail });
+    .insert({
+      work_item_id: workItemId,
+      actor,
+      action,
+      detail,
+      turn_id: ctx?.turnId ?? null,
+      delivery_id: ctx?.deliveryId ?? null,
+    });
   if (error) {
     console.log('[audit.error]', JSON.stringify({ action, error: error.message }));
   }
@@ -61,46 +91,38 @@ async function getOrgContact(orgId: string | null): Promise<{
 }
 
 // ---------------------------------------------------------------------------
-// Helper: create an outbound attempt and set work item to waiting
-// portal channel → respond_after = null (never auto-timed-out by tick)
+// Helper: fetch a work item row (selected columns) or null
 // ---------------------------------------------------------------------------
 
-async function createOutboundAttempt(
-  workItemId: string,
-  channel: OutboundChannel,
-  orgId: string | null,
-  contactSnapshot: Record<string, unknown>,
-  payload: { subject: string; body: string; document?: string; kind?: string },
-  attemptNo: number = 1,
-  waitSeconds?: number,
-): Promise<string> {
-  const sb = getSupabase();
-  const isPortal = channel === 'portal';
-
-  const { data, error } = await sb
-    .from('outbound_attempts')
-    .insert({
-      work_item_id: workItemId,
-      channel,
-      attempt_no: attemptNo,
-      to_org_id: orgId,
-      to_contact: contactSnapshot,
-      payload,
-      status: 'sent',
-      respond_after: isPortal ? null : respondAfter(waitSeconds),
-    })
-    .select('id')
+async function getWorkItem<T>(workItemId: string, columns: string): Promise<T | null> {
+  const { data } = await getSupabase()
+    .from('work_items')
+    .select(columns)
+    .eq('id', workItemId)
     .single();
+  return (data as T) ?? null;
+}
 
-  if (error) throw new Error(`Failed to create outbound attempt: ${error.message}`);
+// ---------------------------------------------------------------------------
+// Helper: merge one key into work_items.confidence (NOT agent_state — direct
+// column write is allowed for type/confidence)
+// ---------------------------------------------------------------------------
 
-  // Set item to waiting
+async function mergeConfidence(workItemId: string, key: string, value: number): Promise<void> {
+  const sb = getSupabase();
+  const { data: item } = await sb
+    .from('work_items')
+    .select('confidence')
+    .eq('id', workItemId)
+    .single();
+  const existing = (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
   await sb
     .from('work_items')
-    .update({ status: 'waiting', updated_at: new Date().toISOString() })
+    .update({
+      confidence: { ...existing, [key]: value },
+      updated_at: new Date().toISOString(),
+    })
     .eq('id', workItemId);
-
-  return (data as { id: string }).id;
 }
 
 // ---------------------------------------------------------------------------
@@ -112,21 +134,16 @@ async function buildOutboundContext(
   orgId: string | null,
   attemptNo: number,
   contact: { fax?: string; email?: string; phone?: string } | null,
+  priorAttemptAt?: string,
 ): Promise<import('./outbound').OutboundContext> {
   const sb = getSupabase();
 
-  const { data: itemData } = await sb
-    .from('work_items')
-    .select('id,extracted_data,matched_patient_id,org_id')
-    .eq('id', workItemId)
-    .single();
-
-  const item = itemData as {
+  const item = await getWorkItem<{
     id: string;
     extracted_data: Record<string, string>;
     matched_patient_id: string | null;
     org_id: string | null;
-  } | null;
+  }>(workItemId, 'id,extracted_data,matched_patient_id,org_id');
 
   const extracted = item?.extracted_data ?? {};
 
@@ -176,6 +193,207 @@ async function buildOutboundContext(
     orgEmail: contact?.email,
     orgPhone: contact?.phone,
     attemptNo,
+    priorAttemptAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Predicate evaluator (verify_requirements) — generic, config-driven
+// ---------------------------------------------------------------------------
+
+function evalPred(item: WorkItem, pred: Pred): boolean {
+  const value = readCasePath(item, pred.path);
+  switch (pred.op) {
+    case 'eq':
+      return value === pred.value;
+    case 'neq':
+      return value !== pred.value;
+    case 'exists':
+      return value !== undefined && value !== null && value !== '';
+    case 'absent':
+      return value === undefined || value === null || value === '';
+    case 'matches':
+      return value === undefined || value === null
+        ? false
+        : new RegExp(String(pred.value), 'i').test(String(value));
+    case 'not_matches':
+      return value === undefined || value === null
+        ? true
+        : !new RegExp(String(pred.value), 'i').test(String(value));
+    case 'in':
+      return Array.isArray(pred.value) && (pred.value as unknown[]).includes(value);
+    default:
+      return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Generic outbound send — shared by send_fax/send_email/send_sms/place_call/
+// send_care_everywhere. Idempotent via dedupe_key; state via mergeCaseState.
+// ---------------------------------------------------------------------------
+
+async function executeSend(
+  toolName: string,
+  channel: OutboundChannel,
+  workItemId: string,
+  params: Record<string, unknown>,
+  actor: string,
+  ctx?: ToolCtx,
+): Promise<ToolResult> {
+  const sb = getSupabase();
+
+  const item = await getWorkItem<{ org_id: string | null; agent_state: Record<string, unknown> | null }>(
+    workItemId,
+    'org_id, agent_state',
+  );
+  if (!item) return { success: false, error: `Work item not found: ${workItemId}` };
+
+  const orgId = item.org_id ?? null;
+  const state = (item.agent_state ?? {}) as Record<string, unknown>;
+
+  const nextAttemptNo = ((state['attempt_no'] as number | undefined) ?? 0) + 1;
+  const stateFlag = params['state_flag'] as string | undefined;
+  const isCareEverywhere = channel === 'care_everywhere';
+
+  // Attempt + document kind. Fulfillment sends (planner marks them records_sent)
+  // deliver the records — render the response document, not another request.
+  // Care Everywhere sends are always structured record queries.
+  const kind: OutboundAttemptKind & DocumentKind = isCareEverywhere
+    ? 'records_request'
+    : stateFlag === 'records_sent'
+      ? 'records_response'
+      : ((state['kind'] as (OutboundAttemptKind & DocumentKind) | undefined) ?? 'records_request');
+
+  // SECOND REQUEST framing — derived from the case's latest timed-out attempt
+  // (replicates the old simulate.ts chase loop: attemptNo = global counter,
+  // priorAttemptAt = created_at of the last timed-out attempt).
+  const { data: lastTimedOut } = await sb
+    .from('outbound_attempts')
+    .select('created_at')
+    .eq('work_item_id', workItemId)
+    .eq('status', 'timed_out')
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  const priorAttemptAt = (lastTimedOut as { created_at: string } | null)?.created_at;
+
+  // channel_attempt = count of prior attempts on the same channel + 1
+  const { count: priorOnChannel } = await sb
+    .from('outbound_attempts')
+    .select('id', { count: 'exact', head: true })
+    .eq('work_item_id', workItemId)
+    .eq('channel', channel);
+  const channelAttempt = (priorOnChannel ?? 0) + 1;
+
+  const contact = await getOrgContact(orgId);
+  const outboundCtx = await buildOutboundContext(workItemId, orgId, nextAttemptNo, contact, priorAttemptAt);
+  const rendered = renderOutboundDocument(channel as Channel, kind, outboundCtx);
+  const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
+
+  // respond_after: care_everywhere → now+8s; portal → null (never auto-resolved
+  // by tick); else chase_plan.waitSeconds if present, else 20-40s random.
+  let respondAfterIso: string | null;
+  if (isCareEverywhere) {
+    respondAfterIso = new Date(Date.now() + 8000).toISOString();
+  } else if (channel === 'portal') {
+    respondAfterIso = null;
+  } else {
+    const chasePlan = state['chase_plan'] as { waitSeconds?: number } | undefined;
+    respondAfterIso = respondAfter(chasePlan?.waitSeconds);
+  }
+
+  const dedupeKey = ctx?.deliveryId ? `${ctx.deliveryId}:${toolName}:${nextAttemptNo}` : null;
+
+  const { data: inserted, error: insertErr } = await sb
+    .from('outbound_attempts')
+    .insert({
+      work_item_id: workItemId,
+      channel,
+      kind,
+      dedupe_key: dedupeKey,
+      attempt_no: nextAttemptNo,
+      to_org_id: orgId,
+      to_contact: { fax: contact?.fax, email: contact?.email, phone: contact?.phone },
+      payload,
+      status: 'sent',
+      respond_after: respondAfterIso,
+    })
+    .select('id')
+    .single();
+
+  if (insertErr) {
+    // At-least-once redelivery hit the dedupe fence → return the existing
+    // attempt as success WITHOUT re-writing state (effectively-once).
+    if (`${insertErr.code}` === '23505' && dedupeKey) {
+      const { data: existing } = await sb
+        .from('outbound_attempts')
+        .select('id')
+        .eq('dedupe_key', dedupeKey)
+        .single();
+      if (existing) {
+        console.log(`[tool.${toolName}]`, JSON.stringify({ workItemId, deduped: true, dedupeKey }));
+        return { success: true, data: { attemptId: (existing as { id: string }).id, deduped: true } };
+      }
+    }
+    return { success: false, error: `Failed to create outbound attempt: ${insertErr.message}` };
+  }
+
+  const attemptId = (inserted as { id: string }).id;
+
+  // Versioned state write — attempt counter, last channel, optional flag.
+  // The planner computes a fresh chase_plan on the first ladder send and passes
+  // it as params.chase_plan; persisting it pins the ladder for the case.
+  const planFromParams = params.chase_plan as Record<string, unknown> | undefined;
+  const merged = await mergeCaseState(workItemId, {
+    set: {
+      attempt_no: nextAttemptNo,
+      last_channel: channel,
+      ...(planFromParams ? { chase_plan: planFromParams } : {}),
+      ...(stateFlag ? { [stateFlag]: true } : {}),
+    },
+  });
+  if (!merged.ok) {
+    console.log(`[tool.${toolName}]`, JSON.stringify({ workItemId, warn: 'state_merge_failed' }));
+  }
+
+  // Item → waiting (direct status update is allowed for attempt-creating tools).
+  await sb
+    .from('work_items')
+    .update({ status: 'waiting', updated_at: new Date().toISOString() })
+    .eq('id', workItemId);
+
+  await emitEvent({
+    type: 'attempt.created',
+    caseId: workItemId,
+    payload: { attemptId, channel, kind },
+    actor,
+    causedBy: ctx?.event ?? null,
+  });
+
+  console.log(
+    `[tool.${toolName}]`,
+    JSON.stringify({ workItemId, orgId, channel, attemptNo: nextAttemptNo, channelAttempt, kind }),
+  );
+
+  return {
+    success: true,
+    data: {
+      attempt_id: attemptId,
+      attemptId,
+      channel,
+      kind,
+      attempt_no: nextAttemptNo,
+      channel_attempt: channelAttempt,
+    },
+  };
+}
+
+function makeSendTool(toolName: string, channel: OutboundChannel, description: string): ToolDef {
+  return {
+    description,
+    effect: 'external',
+    execute: (workItemId, params, actor, ctx) =>
+      executeSend(toolName, channel, workItemId, params, actor, ctx),
   };
 }
 
@@ -186,79 +404,83 @@ async function buildOutboundContext(
 export const TOOLS: Record<string, ToolDef> = {
   // ---- classify_document --------------------------------------------------
   classify_document: {
-    description: 'Classify the document type (referral | records_request_in | unknown).',
-    async execute(workItemId, params, _actor) {
-      const docType = params['document_type'] as string | undefined;
-      if (!docType) return { success: false, error: 'Missing document_type param' };
-
+    description: 'Classify the document type from its source text.',
+    effect: 'annotate',
+    async execute(workItemId, params, actor, ctx) {
       const sb = getSupabase();
-      const { error } = await sb
-        .from('work_items')
-        .update({
-          type: docType,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', workItemId);
 
-      if (error) return { success: false, error: error.message };
+      let docType = params['document_type'] as string | undefined;
+      let conf = params['confidence'] as number | undefined;
 
-      // Merge confidence score
-      const { data: item } = await sb
+      // No explicit type → classify the source text ourselves, honoring any
+      // agent-configured classify_rules on top of the builtin keyword map.
+      if (!docType) {
+        const item = await getWorkItem<{ source_text: string | null }>(workItemId, 'source_text');
+        if (!item) return { success: false, error: `Work item not found: ${workItemId}` };
+        const rules = params['classify_rules'] as Array<{ matches: string; type: string }> | undefined;
+        const result = classifyHeuristic(item.source_text ?? '', rules);
+        docType = result.type;
+        conf = conf ?? result.confidence;
+      }
+
+      const confidence = conf ?? 0.8;
+
+      // type + confidence are NOT agent_state — direct column write is allowed.
+      const { data: current } = await sb
         .from('work_items')
         .select('confidence')
         .eq('id', workItemId)
         .single();
-      const existing = (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
-      await sb
+      const existingConf = (current as { confidence: Record<string, number> } | null)?.confidence ?? {};
+
+      const { error } = await sb
         .from('work_items')
         .update({
-          confidence: { ...existing, classify: params['confidence'] ?? 0.8 },
+          type: docType,
+          confidence: { ...existingConf, classify: confidence },
           updated_at: new Date().toISOString(),
         })
         .eq('id', workItemId);
+      if (error) return { success: false, error: error.message };
 
-      return { success: true, data: { type: docType } };
+      await emitEvent({
+        type: 'document.classified',
+        caseId: workItemId,
+        payload: { as: docType, confidence },
+        actor,
+        causedBy: ctx?.event ?? null,
+      });
+
+      return { success: true, data: { type: docType, confidence } };
     },
   },
 
   // ---- extract_fields -----------------------------------------------------
   extract_fields: {
     description: 'Extract structured fields from the source document.',
-    async execute(workItemId, params, _actor) {
+    effect: 'annotate',
+    async execute(workItemId, params, actor, ctx) {
       const fields = params['fields'] as Record<string, unknown> | undefined;
       if (!fields) return { success: false, error: 'Missing fields param' };
 
-      const sb = getSupabase();
-      const { data: item } = await sb
-        .from('work_items')
-        .select('extracted_data,confidence,agent_state')
-        .eq('id', workItemId)
-        .single();
-
-      const existing = (item as { extracted_data: Record<string, unknown> } | null)
-        ?.extracted_data ?? {};
-      const existingConf =
-        (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
-      const existingState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-
-      // Merge extraction_meta into agent_state when present
       const extractionMeta = params['extraction_meta'] as Record<string, unknown> | undefined;
-      const updatedState = extractionMeta
-        ? { ...existingState, extraction_meta: extractionMeta }
-        : existingState;
 
-      const { error } = await sb
-        .from('work_items')
-        .update({
-          extracted_data: { ...existing, ...fields },
-          confidence: { ...existingConf, extract: params['confidence'] ?? 0.8 },
-          agent_state: updatedState,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', workItemId);
+      const merged = await mergeCaseState(workItemId, {
+        set: extractionMeta ? { extraction_meta: extractionMeta } : {},
+        mergeExtracted: fields,
+      });
+      if (!merged.ok) return { success: false, error: 'Failed to merge extracted fields' };
 
-      if (error) return { success: false, error: error.message };
+      await mergeConfidence(workItemId, 'extract', (params['confidence'] as number | undefined) ?? 0.8);
+
+      await emitEvent({
+        type: 'fields.extracted',
+        caseId: workItemId,
+        payload: { fieldCount: Object.keys(fields).length },
+        actor,
+        causedBy: ctx?.event ?? null,
+      });
+
       return { success: true, data: { extracted_fields: Object.keys(fields) } };
     },
   },
@@ -266,7 +488,8 @@ export const TOOLS: Record<string, ToolDef> = {
   // ---- match_patient -------------------------------------------------------
   match_patient: {
     description: 'Match extracted patient data against the MPI.',
-    async execute(workItemId, params, _actor) {
+    effect: 'annotate',
+    async execute(workItemId, params, actor, ctx) {
       const patientId = params['patient_id'] as string | null | undefined;
       const confidence = (params['confidence'] as number | undefined) ?? 0.8;
 
@@ -276,8 +499,7 @@ export const TOOLS: Record<string, ToolDef> = {
         .select('confidence')
         .eq('id', workItemId)
         .single();
-      const existingConf =
-        (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
+      const existingConf = (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
 
       const updates: Record<string, unknown> = {
         confidence: { ...existingConf, match: confidence },
@@ -288,262 +510,213 @@ export const TOOLS: Record<string, ToolDef> = {
       const { error } = await sb.from('work_items').update(updates).eq('id', workItemId);
       if (error) return { success: false, error: error.message };
 
+      if (patientId) {
+        await emitEvent({
+          type: 'patient.matched',
+          caseId: workItemId,
+          payload: { patientId, confidence },
+          actor,
+          causedBy: ctx?.event ?? null,
+        });
+      }
+
       return { success: true, data: { matched_patient_id: patientId ?? null } };
     },
   },
 
   // ---- verify_requirements ------------------------------------------------
   verify_requirements: {
-    description: 'Verify that an ROI request has patient, records description, and authorization.',
+    description:
+      'Evaluate agent-configured requirement predicates (config.requirements) against case state.',
+    effect: 'annotate',
     async execute(workItemId, params, _actor) {
-      const confidence = (params['confidence'] as number | undefined) ?? 0.8;
-      const requirements = params['requirements'] as Record<string, boolean> | undefined;
-      const sb = getSupabase();
-      const { data: item } = await sb
-        .from('work_items')
-        .select('confidence,agent_state')
-        .eq('id', workItemId)
-        .single();
-      const existingConf =
-        (item as { confidence: Record<string, number> } | null)?.confidence ?? {};
-      const existingState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-
-      const updates: Record<string, unknown> = {
-        confidence: { ...existingConf, verify: confidence },
-        updated_at: new Date().toISOString(),
-      };
-
-      // Store requirements result in agent_state so the planner can check it
-      if (requirements) {
-        updates['agent_state'] = { ...existingState, requirements };
+      const specs = params['requirements'] as RequirementSpec[] | undefined;
+      if (!specs || !Array.isArray(specs) || specs.length === 0) {
+        return { success: false, error: 'Missing requirements param (RequirementSpec[])' };
       }
 
-      await sb.from('work_items').update(updates).eq('id', workItemId);
+      const item = await getWorkItem<WorkItem>(workItemId, '*');
+      if (!item) return { success: false, error: `Work item not found: ${workItemId}` };
 
-      return { success: true, data: params };
+      const flags: Record<string, boolean> = {};
+      for (const spec of specs) {
+        let pass = evalPred(item, { path: spec.path, op: spec.op, value: spec.value });
+        if (pass && spec.and && spec.and.length > 0) {
+          pass = spec.and.every((p) => evalPred(item, p));
+        }
+        flags[spec.flag] = pass;
+      }
+
+      const allPass = Object.values(flags).every(Boolean);
+
+      const merged = await mergeCaseState(workItemId, { set: { requirements: flags } });
+      if (!merged.ok) return { success: false, error: 'Failed to write requirements state' };
+
+      await mergeConfidence(workItemId, 'verify', allPass ? 1.0 : 0.9);
+
+      console.log('[tool.verify_requirements]', JSON.stringify({ workItemId, flags, allPass }));
+      return { success: true, data: { requirements: flags, all_pass: allPass } };
     },
   },
 
-  // ---- advance_stage -------------------------------------------------------
+  // ---- advance_stage (human/manual — Router places the case) ---------------
   advance_stage: {
-    description: 'Move a work item to a different queue (e.g. intake → referrals).',
-    async execute(workItemId, params, _actor) {
+    description: 'Move a work item to a different queue (emits case.moved; the Router places it).',
+    effect: 'external',
+    async execute(workItemId, params, actor, ctx) {
       const queueKey = params['queue_key'] as string | undefined;
-      const type = params['type'] as string | undefined;
       if (!queueKey) return { success: false, error: 'Missing queue_key param' };
 
-      const updates: Record<string, unknown> = {
-        queue_key: queueKey,
-        status: 'open',
-        assignee: 'unassigned',
-        updated_at: new Date().toISOString(),
-      };
-      if (type) updates['type'] = type;
+      // Optional type correction rides along (type is not agent_state — allowed).
+      const type = params['type'] as string | undefined;
+      if (type) {
+        await getSupabase()
+          .from('work_items')
+          .update({ type, updated_at: new Date().toISOString() })
+          .eq('id', workItemId);
+      }
 
-      const { error } = await getSupabase()
-        .from('work_items')
-        .update(updates)
-        .eq('id', workItemId);
+      const event = await emitEvent({
+        type: 'case.moved',
+        caseId: workItemId,
+        payload: { to: queueKey },
+        actor,
+        causedBy: ctx?.event ?? null,
+      });
+      if (!event) return { success: false, error: 'Failed to emit case.moved' };
 
-      if (error) return { success: false, error: error.message };
-      return { success: true, data: { queue_key: queueKey } };
+      return { success: true, data: { queue_key: queueKey, eventId: event.id } };
     },
   },
 
-  // ---- send_fax -----------------------------------------------------------
-  send_fax: {
-    description: 'Send a fax outbound and set item to waiting.',
-    async execute(workItemId, params, actor) {
-      const { data: item } = await getSupabase()
-        .from('work_items')
-        .select('org_id, agent_state')
-        .eq('id', workItemId)
-        .single();
+  // ---- send tools -----------------------------------------------------------
+  send_fax: makeSendTool('send_fax', 'fax', 'Send a fax outbound and set item to waiting.'),
+  send_email: makeSendTool('send_email', 'email', 'Send an email outbound and set item to waiting.'),
+  send_sms: makeSendTool('send_sms', 'sms', 'Send an SMS outbound and set item to waiting.'),
+  place_call: makeSendTool('place_call', 'voice', 'Place a voice call outbound and set item to waiting.'),
+  send_care_everywhere: makeSendTool(
+    'send_care_everywhere',
+    'care_everywhere',
+    'Send a structured Care Everywhere record query (C-CDA) — instant exchange, responds in seconds.',
+  ),
 
-      const orgId = (item as { org_id: string | null } | null)?.org_id ?? null;
-      const agentState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-      const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const stateFlag = params['state_flag'] as string | undefined;
-      // Fulfillment sends (planner marks them records_sent) deliver the
-      // records — render the response document, not another request.
-      const kind: DocumentKind =
-        stateFlag === 'records_sent'
-          ? 'records_response'
-          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
-
-      const contact = await getOrgContact(orgId);
-      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
-      const rendered = renderOutboundDocument('fax', kind, ctx);
-      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
-
-      const result = await sendViaChannel(workItemId, 'fax', orgId, payload, actor, attemptNo, agentState, stateFlag);
-      console.log('[tool.send_fax]', JSON.stringify({ workItemId, orgId, attemptNo }));
-      return result;
-    },
-  },
-
-  // ---- send_email ---------------------------------------------------------
-  send_email: {
-    description: 'Send an email outbound and set item to waiting.',
-    async execute(workItemId, params, actor) {
-      const { data: item } = await getSupabase()
-        .from('work_items')
-        .select('org_id, agent_state')
-        .eq('id', workItemId)
-        .single();
-
-      const orgId = (item as { org_id: string | null } | null)?.org_id ?? null;
-      const agentState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-      const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const stateFlag = params['state_flag'] as string | undefined;
-      // Fulfillment sends (planner marks them records_sent) deliver the
-      // records — render the response document, not another request.
-      const kind: DocumentKind =
-        stateFlag === 'records_sent'
-          ? 'records_response'
-          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
-
-      const contact = await getOrgContact(orgId);
-      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
-      const rendered = renderOutboundDocument('email', kind, ctx);
-      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
-
-      const result = await sendViaChannel(workItemId, 'email', orgId, payload, actor, attemptNo, agentState, stateFlag);
-      console.log('[tool.send_email]', JSON.stringify({ workItemId, orgId, attemptNo }));
-      return result;
-    },
-  },
-
-  // ---- send_sms -----------------------------------------------------------
-  send_sms: {
-    description: 'Send an SMS outbound and set item to waiting.',
-    async execute(workItemId, params, actor) {
-      const { data: item } = await getSupabase()
-        .from('work_items')
-        .select('org_id, agent_state')
-        .eq('id', workItemId)
-        .single();
-
-      const orgId = (item as { org_id: string | null } | null)?.org_id ?? null;
-      const agentState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-      const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const stateFlag = params['state_flag'] as string | undefined;
-      // Fulfillment sends (planner marks them records_sent) deliver the
-      // records — render the response document, not another request.
-      const kind: DocumentKind =
-        stateFlag === 'records_sent'
-          ? 'records_response'
-          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
-
-      const contact = await getOrgContact(orgId);
-      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
-      const rendered = renderOutboundDocument('sms', kind, ctx);
-      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
-
-      const result = await sendViaChannel(workItemId, 'sms', orgId, payload, actor, attemptNo, agentState, stateFlag);
-      console.log('[tool.send_sms]', JSON.stringify({ workItemId, orgId, attemptNo }));
-      return result;
-    },
-  },
-
-  // ---- place_call ---------------------------------------------------------
-  place_call: {
-    description: 'Place a voice call outbound and set item to waiting.',
-    async execute(workItemId, params, actor) {
-      const { data: item } = await getSupabase()
-        .from('work_items')
-        .select('org_id, agent_state')
-        .eq('id', workItemId)
-        .single();
-
-      const orgId = (item as { org_id: string | null } | null)?.org_id ?? null;
-      const agentState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-      const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const stateFlag = params['state_flag'] as string | undefined;
-      // Fulfillment sends (planner marks them records_sent) deliver the
-      // records — render the response document, not another request.
-      const kind: DocumentKind =
-        stateFlag === 'records_sent'
-          ? 'records_response'
-          : ((agentState['kind'] as DocumentKind | undefined) ?? 'records_request');
-
-      const contact = await getOrgContact(orgId);
-      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
-      const rendered = renderOutboundDocument('voice', kind, ctx);
-      const payload = { subject: rendered.subject, body: rendered.body, document: rendered.document, kind };
-
-      const result = await sendViaChannel(workItemId, 'voice', orgId, payload, actor, attemptNo, agentState, stateFlag);
-      console.log('[tool.place_call]', JSON.stringify({ workItemId, orgId, attemptNo }));
-      return result;
-    },
+  // Alias: some configs/UIs say 'send_voice' — delegates to place_call.
+  send_voice: {
+    description: 'Place a voice call outbound (alias of place_call).',
+    effect: 'external',
+    execute: (workItemId, params, actor, ctx) =>
+      TOOLS['place_call'].execute(workItemId, params, actor, ctx),
   },
 
   // ---- request_more_info --------------------------------------------------
   request_more_info: {
     description: 'Send an outbound request for more information to the requesting org.',
-    async execute(workItemId, params, actor) {
-      const { data: item } = await getSupabase()
-        .from('work_items')
-        .select('org_id, agent_state')
-        .eq('id', workItemId)
-        .single();
+    effect: 'external',
+    async execute(workItemId, params, actor, ctx) {
+      const sb = getSupabase();
 
-      const orgId = (item as { org_id: string | null } | null)?.org_id ?? null;
-      const agentState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
+      const item = await getWorkItem<{ org_id: string | null; agent_state: Record<string, unknown> | null }>(
+        workItemId,
+        'org_id, agent_state',
+      );
+      if (!item) return { success: false, error: `Work item not found: ${workItemId}` };
+
+      const orgId = item.org_id ?? null;
+      const state = (item.agent_state ?? {}) as Record<string, unknown>;
 
       const contact = await getOrgContact(orgId);
       const rawChannel = contact?.preferred_channel ?? 'fax';
       // portal orgs: fall back to fax for more-info since portal is handled differently
       const channel = (rawChannel === 'portal' ? 'fax' : rawChannel) as OutboundChannel;
-      const contactSnapshot: Record<string, unknown> = {
-        fax: contact?.fax,
-        email: contact?.email,
-        phone: contact?.phone,
-      };
 
-      const attemptNo = ((agentState['attempt_no'] as number | undefined) ?? 0) + 1;
-      const ctx = await buildOutboundContext(workItemId, orgId, attemptNo, contact);
-      const rendered = renderOutboundDocument(channel as Channel, 'request_more_info', ctx);
+      const nextAttemptNo = ((state['attempt_no'] as number | undefined) ?? 0) + 1;
+      const message =
+        (params['message'] as string | undefined) ??
+        (params['reason'] as string | undefined) ??
+        'Missing patient authorization. Please provide signed authorization form.';
+
+      const outboundCtx = await buildOutboundContext(workItemId, orgId, nextAttemptNo, contact);
+      const rendered = renderOutboundDocument(channel as Channel, 'request_more_info', outboundCtx);
       const payload = {
         subject: rendered.subject,
         body: rendered.body,
         document: rendered.document,
         kind: 'request_more_info',
+        message,
       };
 
-      const attemptId = await createOutboundAttempt(
-        workItemId,
-        channel,
-        orgId,
-        contactSnapshot,
-        payload,
-        attemptNo,
-      );
+      const dedupeKey = ctx?.deliveryId ? `${ctx.deliveryId}:request_more_info:${nextAttemptNo}` : null;
 
-      // Mark agent_state so we don't re-send
-      await getSupabase()
-        .from('work_items')
-        .update({
-          agent_state: { ...agentState, more_info_sent: true, attempt_no: attemptNo },
-          updated_at: new Date().toISOString(),
+      const { data: inserted, error: insertErr } = await sb
+        .from('outbound_attempts')
+        .insert({
+          work_item_id: workItemId,
+          channel,
+          kind: 'request_more_info',
+          dedupe_key: dedupeKey,
+          attempt_no: nextAttemptNo,
+          to_org_id: orgId,
+          to_contact: { fax: contact?.fax, email: contact?.email, phone: contact?.phone },
+          payload,
+          status: 'sent',
+          respond_after: channel === 'portal' ? null : respondAfter(),
         })
+        .select('id')
+        .single();
+
+      if (insertErr) {
+        if (`${insertErr.code}` === '23505' && dedupeKey) {
+          const { data: existing } = await sb
+            .from('outbound_attempts')
+            .select('id')
+            .eq('dedupe_key', dedupeKey)
+            .single();
+          if (existing) {
+            console.log('[tool.request_more_info]', JSON.stringify({ workItemId, deduped: true, dedupeKey }));
+            return { success: true, data: { attemptId: (existing as { id: string }).id, deduped: true } };
+          }
+        }
+        return { success: false, error: `Failed to create outbound attempt: ${insertErr.message}` };
+      }
+
+      const attemptId = (inserted as { id: string }).id;
+
+      // Mark agent_state so we don't re-send (versioned write). more_info_count
+      // feeds the planner's on_missing.max_requests escalation.
+      const priorCount = Number((state as Record<string, unknown>)['more_info_count'] ?? 0);
+      const merged = await mergeCaseState(workItemId, {
+        set: { more_info_sent: true, attempt_no: nextAttemptNo, more_info_count: priorCount + 1 },
+      });
+      if (!merged.ok) {
+        console.log('[tool.request_more_info]', JSON.stringify({ workItemId, warn: 'state_merge_failed' }));
+      }
+
+      await sb
+        .from('work_items')
+        .update({ status: 'waiting', updated_at: new Date().toISOString() })
         .eq('id', workItemId);
 
-      console.log('[tool.request_more_info]', JSON.stringify({ workItemId, attemptId }));
-      return { success: true, data: { attempt_id: attemptId, channel, kind: 'request_more_info' } };
+      await emitEvent({
+        type: 'attempt.created',
+        caseId: workItemId,
+        payload: { attemptId, channel, kind: 'request_more_info' },
+        actor,
+        causedBy: ctx?.event ?? null,
+      });
+
+      console.log('[tool.request_more_info]', JSON.stringify({ workItemId, attemptId, channel }));
+      return {
+        success: true,
+        data: { attempt_id: attemptId, attemptId, channel, kind: 'request_more_info' },
+      };
     },
   },
 
-  // ---- mark_complete -------------------------------------------------------
+  // ---- mark_complete (human/manual use; agents use report_result) ----------
   mark_complete: {
     description: 'Mark a work item as done.',
-    async execute(workItemId, params, _actor) {
+    effect: 'external',
+    async execute(workItemId, params, actor, ctx) {
       const { error } = await getSupabase()
         .from('work_items')
         .update({
@@ -552,295 +725,86 @@ export const TOOLS: Record<string, ToolDef> = {
           updated_at: new Date().toISOString(),
         })
         .eq('id', workItemId);
-
       if (error) return { success: false, error: error.message };
+
+      await emitEvent({
+        type: 'case.completed',
+        caseId: workItemId,
+        payload: { result: (params['note'] as string | undefined) ?? 'completed' },
+        actor,
+        causedBy: ctx?.event ?? null,
+      });
+
       const note = (params['note'] as string | undefined) ?? 'Completed.';
       return { success: true, data: { note } };
     },
   },
 
-  // ---- escalate_to_human --------------------------------------------------
+  // ---- escalate_to_human (human/manual use; agents use request_human_review)
   escalate_to_human: {
-    description: 'Escalate a work item to Human Review with a specific question.',
-    async execute(workItemId, params, _actor) {
-      const question =
-        (params['question'] as string | undefined) ?? 'Needs human review.';
+    description: 'Escalate a work item to a human with a specific question (exception review).',
+    effect: 'external',
+    async execute(workItemId, params, _actor, ctx) {
+      const question = (params['question'] as string | undefined) ?? 'Needs human attention';
 
-      const { error } = await getSupabase()
-        .from('work_items')
-        .update({
-          queue_key: 'human_review',
-          assignee: 'human',
-          review_reason: question,
-          status: 'open',
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', workItemId);
-
-      if (error) return { success: false, error: error.message };
-      return { success: true, data: { question } };
-    },
-  },
-
-  // ---- approve_action (human-only) ----------------------------------------
-  approve_action: {
-    description: 'Approve a pending supervised-mode agent proposal and execute it.',
-    async execute(workItemId, _params, actor) {
-      const sb = getSupabase();
-      const { data: item } = await sb
-        .from('work_items')
-        .select('agent_state')
-        .eq('id', workItemId)
-        .single();
-
-      const agentState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-      const pending = agentState['pending_approval'] as
-        | {
-            action: string;
-            params: Record<string, unknown>;
-            confidence: number;
-            rationale: string;
-            agentId: string;
-            agentName: string;
-          }
-        | undefined;
-
-      if (!pending) {
-        return { success: false, error: 'No pending_approval on this item' };
-      }
-
-      const returnQueue = (agentState['return_queue'] as string | undefined) ?? 'intake';
-      const approvedActor = `human(approved:${pending.agentName})`;
-
-      // Execute the stored action
-      const result = await runTool(pending.action, workItemId, pending.params, approvedActor);
-
-      // Clear pending_approval and return to the original queue — but build the
-      // new agent_state from a FRESH read: the executed tool may have just
-      // written its own state (attempt_no, records_sent, …) and writing the
-      // pre-execution snapshot back would erase it and cause a re-proposal loop.
-      const { data: afterItem } = await sb
-        .from('work_items')
-        .select('agent_state,status')
-        .eq('id', workItemId)
-        .single();
-      const afterRow = afterItem as
-        | { agent_state: Record<string, unknown>; status: string }
-        | null;
-      const { return_queue: _rq, pending_approval: _pa, ...restState } =
-        (afterRow?.agent_state ?? agentState) as Record<string, unknown>;
-      void _rq; void _pa;
-      await sb
-        .from('work_items')
-        .update({
-          agent_state: restState,
-          queue_key: returnQueue,
-          assignee: 'unassigned',
-          review_reason: null,
-          // Preserve 'waiting' when the approved action was an outbound send
-          // (its respond/timeout lifecycle owns the item now).
-          status: afterRow?.status === 'waiting' ? 'waiting' : 'open',
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', workItemId);
-
-      console.log('[tool.approve_action]', JSON.stringify({ workItemId, action: pending.action, actor }));
-      return { success: true, data: { approved_action: pending.action, tool_result: result } };
-    },
-  },
-
-  // ---- reject_action (human-only) -----------------------------------------
-  reject_action: {
-    description: 'Reject a pending supervised-mode agent proposal and escalate for manual handling.',
-    async execute(workItemId, _params, _actor) {
-      const sb = getSupabase();
-      const { data: item } = await sb
-        .from('work_items')
-        .select('agent_state')
-        .eq('id', workItemId)
-        .single();
-
-      const agentState =
-        (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-      const pending = agentState['pending_approval'] as
-        | { action: string; agentName: string }
-        | undefined;
-
-      const actionName = pending?.action ?? 'unknown';
-
-      // Clear pending_approval and escalate
-      const { pending_approval: _pa, return_queue: _rq, ...restState } = agentState as Record<string, unknown>;
-      void _pa; void _rq;
-      await sb
-        .from('work_items')
-        .update({
-          agent_state: restState,
-          updated_at: new Date().toISOString(),
-        })
-        .eq('id', workItemId);
-
-      // Escalate with reason
-      const escalateResult = await runTool(
-        'escalate_to_human',
-        workItemId,
-        { question: `Proposed ${actionName} rejected — handle manually.` },
-        _actor,
+      const review = await createReviewRequest(
+        { caseId: workItemId, kind: 'exception', question },
+        ctx,
       );
+      if (!review) return { success: false, error: 'Failed to create review request' };
 
-      console.log('[tool.reject_action]', JSON.stringify({ workItemId, rejectedAction: actionName }));
-      return { success: true, data: { rejected_action: actionName, escalate: escalateResult } };
+      // Surface the question on the item; queue placement belongs to the Router.
+      await getSupabase()
+        .from('work_items')
+        .update({ review_reason: question, updated_at: new Date().toISOString() })
+        .eq('id', workItemId);
+
+      return { success: true, data: { question, reviewId: review.id } };
     },
   },
 
-  // ---- resolve_review (human-only) ----------------------------------------
+  // ---- approve_action (human-only; thin delegate to reviews) ----------------
+  approve_action: {
+    description: 'Approve the pending supervised-mode agent proposal for this case and execute it.',
+    effect: 'external',
+    async execute(workItemId, _params, actor) {
+      const review = await findPendingReview(workItemId, 'approval');
+      if (!review) return { success: false, error: 'No pending review' };
+      return answerReview(review.id, { decision: 'approve' }, actor);
+    },
+  },
+
+  // ---- reject_action (human-only; thin delegate to reviews) -----------------
+  reject_action: {
+    description: 'Reject the pending supervised-mode agent proposal for this case.',
+    effect: 'external',
+    async execute(workItemId, _params, actor) {
+      const review = await findPendingReview(workItemId, 'approval');
+      if (!review) return { success: false, error: 'No pending review' };
+      return answerReview(review.id, { decision: 'reject' }, actor);
+    },
+  },
+
+  // ---- resolve_review (human-only; thin delegate to reviews) ----------------
   resolve_review: {
-    description: 'Resolve a Human Review escalation: apply correction and route onward.',
-    async execute(workItemId, params, _actor) {
-      const chosenPatientId = (params['patient_id'] ?? params['patientId']) as
-        | string
-        | undefined;
-      const nextQueue = (params['queue_key'] ?? params['queueKey']) as string | undefined;
-      const correctedFields = params['fields'] as Record<string, string> | undefined;
-
-      const sb = getSupabase();
-
-      // Fetch current item state for merging
-      const { data: currentItem } = await sb
-        .from('work_items')
-        .select('type,confidence,extracted_data')
-        .eq('id', workItemId)
-        .single();
-
-      const existingConf =
-        (currentItem as { confidence: Record<string, number> } | null)?.confidence ?? {};
-      const existingExtracted =
-        (currentItem as { extracted_data: Record<string, unknown> } | null)?.extracted_data ?? {};
-
-      const updates: Record<string, unknown> = {
-        assignee: 'unassigned',
-        review_reason: null,
-        status: 'open',
-        updated_at: new Date().toISOString(),
-      };
-
-      // Merge corrected fields and audit which keys changed
-      let changedKeys: string[] = [];
-      let patientFieldsChanged = false;
-      if (correctedFields && Object.keys(correctedFields).length > 0) {
-        const patientFieldSet = new Set(['patient_first_name', 'patient_last_name', 'patient_dob', 'patient_mrn', 'patient_name']);
-        changedKeys = Object.keys(correctedFields).filter(
-          (k) => existingExtracted[k] !== correctedFields[k],
-        );
-        patientFieldsChanged = changedKeys.some((k) => patientFieldSet.has(k));
-        updates['extracted_data'] = { ...existingExtracted, ...correctedFields };
-      }
-
-      if (chosenPatientId) {
-        updates['matched_patient_id'] = chosenPatientId;
-        updates['confidence'] = { ...existingConf, match: 0.99 };
-      } else if (patientFieldsChanged && correctedFields) {
-        // Re-run patient match with corrected fields
-        const mergedExtracted = { ...existingExtracted, ...correctedFields } as Record<string, string>;
-        const matchResult = await matchPatientHeuristic(mergedExtracted);
-        if (matchResult.patientId) {
-          updates['matched_patient_id'] = matchResult.patientId;
-          updates['confidence'] = { ...existingConf, match: matchResult.confidence };
-        } else {
-          updates['confidence'] = { ...existingConf, match: matchResult.confidence };
-        }
-      }
-
-      if (nextQueue) {
-        updates['queue_key'] = nextQueue;
-      } else {
-        // Default routing after review
-        const itemType = (currentItem as { type: string } | null)?.type;
-        if (itemType === 'referral') updates['queue_key'] = 'referrals';
-        else if (itemType === 'records_request_in') updates['queue_key'] = 'roi_incoming';
-        else updates['queue_key'] = 'intake';
-      }
-
-      const { error } = await sb.from('work_items').update(updates).eq('id', workItemId);
-      if (error) return { success: false, error: error.message };
-      return {
-        success: true,
-        data: {
-          resolved: true,
-          patient_id: chosenPatientId ?? null,
-          changed_fields: changedKeys,
+    description: 'Resolve a pending review: apply corrections and let the Router route onward.',
+    effect: 'external',
+    async execute(workItemId, params, actor) {
+      const review = await findPendingReview(workItemId);
+      if (!review) return { success: false, error: 'No pending review' };
+      return answerReview(
+        review.id,
+        {
+          decision: 'resolve',
+          fields: params['fields'],
+          patientId: params['patientId'] ?? params['patient_id'],
+          queueKey: params['queueKey'] ?? params['queue_key'],
         },
-      };
+        actor,
+      );
     },
   },
 };
-
-// ---------------------------------------------------------------------------
-// Internal: send via a specific channel
-// ---------------------------------------------------------------------------
-
-async function sendViaChannel(
-  workItemId: string,
-  channel: OutboundChannel,
-  orgId: string | null,
-  payload: { subject: string; body: string; document?: string; kind?: string },
-  _actor: string,
-  attemptNo: number,
-  currentAgentState?: Record<string, unknown>,
-  stateFlag?: string,
-): Promise<ToolResult> {
-  const contact = await getOrgContact(orgId);
-  const contactSnapshot: Record<string, unknown> = {
-    fax: contact?.fax,
-    email: contact?.email,
-    phone: contact?.phone,
-  };
-
-  // Inherit waitSeconds from chase_plan if present
-  const chasePlan = (currentAgentState?.['chase_plan'] as { waitSeconds?: number } | undefined);
-  const waitSeconds = chasePlan?.waitSeconds;
-
-  const attemptId = await createOutboundAttempt(
-    workItemId,
-    channel,
-    orgId,
-    contactSnapshot,
-    payload,
-    attemptNo,
-    waitSeconds,
-  );
-
-  // Read current agent_state if not provided
-  let agentState = currentAgentState;
-  if (!agentState) {
-    const { data: item } = await getSupabase()
-      .from('work_items')
-      .select('agent_state')
-      .eq('id', workItemId)
-      .single();
-    agentState = (item as { agent_state: Record<string, unknown> } | null)?.agent_state ?? {};
-  }
-
-  const newState: Record<string, unknown> = {
-    ...agentState,
-    attempt_no: attemptNo,
-    last_channel: channel,
-  };
-  // Set a boolean flag in agent_state when requested (e.g. records_sent=true)
-  if (stateFlag) {
-    newState[stateFlag] = true;
-  }
-
-  await getSupabase()
-    .from('work_items')
-    .update({
-      agent_state: newState,
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', workItemId);
-
-  return { success: true, data: { attempt_id: attemptId, channel } };
-}
 
 // ---------------------------------------------------------------------------
 // Public: runTool
@@ -851,27 +815,34 @@ export async function runTool(
   workItemId: string,
   params: Record<string, unknown>,
   actor: string,
+  ctx?: ToolCtx,
 ): Promise<ToolResult> {
   const tool = TOOLS[toolName];
   if (!tool) {
     const err = `Unknown tool: ${toolName}`;
-    await audit(workItemId, actor, toolName, { error: err, params });
+    await audit(workItemId, actor, toolName, { error: err, params }, ctx);
     return { success: false, error: err };
   }
 
   let result: ToolResult;
   try {
-    result = await tool.execute(workItemId, params, actor);
+    result = await tool.execute(workItemId, params, actor, ctx);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     result = { success: false, error: msg };
   }
 
-  await audit(workItemId, actor, toolName, {
-    params,
-    result,
-    confidence: params['confidence'] ?? null,
-  });
+  await audit(
+    workItemId,
+    actor,
+    toolName,
+    {
+      params,
+      result,
+      confidence: params['confidence'] ?? null,
+    },
+    ctx,
+  );
 
   return result;
 }

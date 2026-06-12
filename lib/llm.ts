@@ -1,26 +1,67 @@
 /**
- * lib/llm.ts — model-agnostic reasoning helper.
+ * lib/llm.ts — model-agnostic reasoning helper (the planner).
  *
  * reason(input) → Decision
  *
  * If ANTHROPIC_API_KEY is set AND agent.model !== 'heuristic':
- *   call Anthropic Messages API (claude-haiku-4-5-20251001) with a JSON-output
- *   prompt; parse strictly; fall back to heuristic on any error.
+ *   call Anthropic Messages API with a JSON-output prompt (the agent's named
+ *   policies are serialized into the system prompt so the LLM sees the same
+ *   policy as the heuristic engine); parse strictly; fall back to heuristic
+ *   on any error.
  *
- * Otherwise (default): deterministic heuristic engine — fully powers the demo
- * with no API key.
+ * Otherwise (default): the GENERIC SKILL LIBRARY — a deterministic,
+ * first-match-wins planner gated ONLY on (tool allowlist ∩ presence of named
+ * config ∩ state predicates ∩ triggering event type). It never references
+ * workflow-specific literals (no case types, no queue keys) — workflow
+ * knowledge lives entirely in agent config. Fully powers the demo with no
+ * API key.
  */
 
+import { readCasePath } from './caseState';
+import { buildChannelPlan } from './outbound';
 import { getSupabase } from './supabase';
-import type { Agent, Decision, Patient, ReasoningInput, WorkItem } from './types';
+import type {
+  Agent,
+  ChasePlan,
+  Cond,
+  Decision,
+  Patient,
+  Pred,
+  ReasoningInput,
+  RequirementSpec,
+  WorkItem,
+} from './types';
 
 // ---------------------------------------------------------------------------
-// Heuristic helpers
+// Heuristic sub-engines (classification / extraction / patient match)
 // ---------------------------------------------------------------------------
 
-/** Match keywords for document classification */
-function classifyHeuristic(text: string): { type: string; confidence: number } {
+/**
+ * Match keywords for document classification.
+ *
+ * `rules` (agent config.classify_rules) are checked FIRST as case-insensitive
+ * regexes — they extend/override the builtin keyword map.
+ */
+export function classifyHeuristic(
+  text: string,
+  rules?: Array<{ matches: string; type: string }>,
+): { type: string; confidence: number } {
   const t = text.toLowerCase();
+
+  // User-configured rules win over the builtin map (first match)
+  for (const rule of rules ?? []) {
+    if (!rule?.matches || !rule?.type) continue;
+    let re: RegExp;
+    try {
+      re = new RegExp(rule.matches, 'i');
+    } catch {
+      continue; // bad user regex — skip the rule
+    }
+    if (re.test(text)) {
+      const conf = /patient:|dob:|from:|reason:|npi/.test(t) ? 0.95 : 0.9;
+      return { type: rule.type, confidence: conf };
+    }
+  }
 
   // High-confidence referral keywords
   if (/\breferral\b/.test(t) || /\breferral request\b/.test(t)) {
@@ -54,7 +95,7 @@ export interface ExtractionMeta {
 }
 
 /** Extract labeled fields from text, also computing per-field extraction_meta */
-function extractHeuristic(text: string): {
+export function extractHeuristic(text: string): {
   fields: Record<string, string>;
   confidence: number;
   extraction_meta: ExtractionMeta;
@@ -163,8 +204,13 @@ function extractHeuristic(text: string): {
   return { fields, confidence, extraction_meta: { fields: metaFields } };
 }
 
-/** Match a patient by name+DOB against the MPI */
-async function matchPatientHeuristic(
+/**
+ * Match a patient by name+DOB against the MPI.
+ *
+ * Always returns `candidates` (possibly empty) for ambiguous/fuzzy cases so
+ * the runner can attach them to review requests.
+ */
+export async function matchPatientHeuristic(
   fields: Record<string, string>,
 ): Promise<{
   patientId: string | null;
@@ -273,29 +319,35 @@ async function matchPatientHeuristic(
 }
 
 // ---------------------------------------------------------------------------
-// Generic planner — derives next action from agent.tools + item state.
-// First-match-wins per spec §1. Keeps all existing heuristic logic intact.
+// Send tool picker
 // ---------------------------------------------------------------------------
 
-/** Channel preference order for send tools */
+/** Channel preference fallback order for send tools */
 const SEND_TOOL_ORDER = ['send_fax', 'send_email', 'send_sms', 'place_call'] as const;
 
-/** Pick the first allowed send tool, optionally preferring an org channel */
-function pickSendTool(
+/** Map a channel name to its send tool */
+function toolForChannel(channel: string): string {
+  if (channel === 'voice' || channel === 'phone') return 'place_call';
+  if (channel === 'care_everywhere') return 'send_care_everywhere';
+  return `send_${channel}`;
+}
+
+/**
+ * Pick the first allowed send tool, optionally preferring a channel.
+ * voice → 'place_call', care_everywhere → 'send_care_everywhere',
+ * else send_<channel>; fallback order send_fax, send_email, send_sms,
+ * place_call filtered by the allowlist.
+ */
+export function pickSendTool(
   allowedTools: string[],
-  preferredChannel?: string,
+  channel?: string,
 ): string | null {
-  const channelToTool: Record<string, string> = {
-    fax: 'send_fax',
-    email: 'send_email',
-    sms: 'send_sms',
-    voice: 'place_call',
-    phone: 'place_call',
-  };
-  // Try preferred channel first
-  if (preferredChannel && preferredChannel !== 'portal') {
-    const preferred = channelToTool[preferredChannel];
-    if (preferred && allowedTools.includes(preferred)) return preferred;
+  // Try preferred channel first (portal is never an outbound send channel)
+  if (channel && channel !== 'portal') {
+    const preferred = toolForChannel(channel);
+    if (allowedTools.includes(preferred)) return preferred;
+    // 'send_voice' is an allowlist alias of place_call
+    if (preferred === 'place_call' && allowedTools.includes('send_voice')) return 'send_voice';
   }
   // Fall back through ordered list
   for (const tool of SEND_TOOL_ORDER) {
@@ -304,30 +356,183 @@ function pickSendTool(
   return null;
 }
 
+// ---------------------------------------------------------------------------
+// Predicate DSL evaluator (complete_when / requirements / send_policy.when)
+// ---------------------------------------------------------------------------
+
+/** Loose scalar equality: strict first, then stringified primitives. */
+function looseEq(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (a === null || a === undefined || b === null || b === undefined) return false;
+  if (typeof a === 'object' || typeof b === 'object') {
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch {
+      return false;
+    }
+  }
+  return String(a) === String(b);
+}
+
+/** Presence check: undefined/null/'' all count as absent. */
+function valueExists(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== '';
+}
+
+/** Evaluate one Pred against case paths (state.x / extracted.x / case.x). */
+function evalPred(item: WorkItem, pred: Pred): boolean {
+  const value = readCasePath(item, pred.path);
+  switch (pred.op) {
+    case 'eq':
+      return looseEq(value, pred.value);
+    case 'neq':
+      return !looseEq(value, pred.value);
+    case 'exists':
+      return valueExists(value);
+    case 'absent':
+      return !valueExists(value);
+    case 'matches':
+    case 'not_matches': {
+      let re: RegExp;
+      try {
+        re = new RegExp(String(pred.value ?? ''), 'i');
+      } catch {
+        return false; // bad user regex — never matches (and never not_matches)
+      }
+      const hit = re.test(String(value ?? ''));
+      return pred.op === 'matches' ? hit : !hit;
+    }
+    case 'in':
+      return Array.isArray(pred.value) && pred.value.some((v) => looseEq(v, value));
+    default:
+      return false;
+  }
+}
+
+/** Evaluate a Cond {all/any}. Missing/empty cond is vacuously true. */
+function evalCond(item: WorkItem, cond?: Cond): boolean {
+  if (!cond) return true;
+  const allOk = (cond.all ?? []).every((p) => evalPred(item, p));
+  const anyOk = cond.any && cond.any.length > 0 ? cond.any.some((p) => evalPred(item, p)) : true;
+  return allOk && anyOk;
+}
+
+/** Render {{state.x}} / {{extracted.x}} / {{case.id8}} templates from case paths. */
+function renderTemplate(item: WorkItem, template: string): string {
+  return template.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_m, token: string) => {
+    if (token === 'case.id8') return item.id.slice(0, 8).toUpperCase();
+    const value = readCasePath(item, token);
+    return value === undefined || value === null ? '' : String(value);
+  });
+}
+
+/**
+ * All configured requirement flags verified true?
+ * - state.requirements present → every configured flag must be true
+ *   (every flag at all if no config list).
+ * - state.requirements absent → pass only if NO requirements are configured.
+ */
+function allRequirementFlagsTrue(
+  agentState: Record<string, unknown>,
+  requirements: RequirementSpec[] | undefined,
+): boolean {
+  const flags = agentState['requirements'] as Record<string, boolean> | undefined;
+  if (flags === undefined) return !requirements || requirements.length === 0;
+  if (requirements && requirements.length > 0) {
+    return requirements.every((spec) => flags[spec.flag] === true);
+  }
+  return Object.values(flags).every((v) => v === true);
+}
+
+/** Load org channels+contact for buildChannelPlan (chase ladder init). */
+async function loadOrgForPlan(orgId: string | null): Promise<{
+  channels?: string[];
+  contact?: {
+    fax?: string;
+    email?: string;
+    phone?: string;
+    preferred_channel?: string;
+    chase_policy?: { steps?: string[]; waitSeconds?: number };
+  };
+} | null> {
+  if (!orgId) return null;
+  const sb = getSupabase();
+  const { data, error } = await sb
+    .from('organizations')
+    .select('id,name,contact,channels')
+    .eq('id', orgId)
+    .maybeSingle();
+  if (error || !data) {
+    if (error) console.log('[llm.org_lookup_failed]', JSON.stringify({ orgId, error: error.message }));
+    return null;
+  }
+  return data as {
+    channels?: string[];
+    contact?: {
+      fax?: string;
+      email?: string;
+      phone?: string;
+      preferred_channel?: string;
+      chase_policy?: { steps?: string[]; waitSeconds?: number };
+    };
+  };
+}
+
+// ---------------------------------------------------------------------------
+// GENERIC SKILL LIBRARY — first-match-wins planner.
+// Each skill is gated ONLY on (tool allowlist ∩ presence of named config ∩
+// state predicates ∩ triggering event type). No case-type or queue literals.
+// ---------------------------------------------------------------------------
+
+const DEFAULT_MORE_INFO_MESSAGE =
+  'Missing patient authorization. Please provide signed authorization form.';
+
 async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
-  const { workItem, agent, stepHistory } = input;
+  const { workItem, agent, event } = input;
   const tools = agent.tools;
-  const alreadyDone = new Set(stepHistory);
+  const config = agent.config ?? {};
   const text = workItem.source_text ?? '';
   const extracted = workItem.extracted_data as Record<string, string>;
   const agentState = workItem.agent_state as Record<string, unknown>;
   const confidence = workItem.confidence as Record<string, number>;
 
   // -----------------------------------------------------------------------
-  // Rule 1: classify_document allowed AND confidence.classify absent
+  // S0 — complete_when: declared outcomes are evaluated before everything
+  // -----------------------------------------------------------------------
+  if (Array.isArray(config.complete_when)) {
+    for (const spec of config.complete_when) {
+      if (!spec?.when || !spec?.outcome) continue;
+      if (evalCond(workItem, spec.when)) {
+        const params: Record<string, unknown> = { result: spec.outcome.result };
+        if (spec.outcome.note) params['note'] = renderTemplate(workItem, spec.outcome.note);
+        return {
+          action: 'report_result',
+          params,
+          confidence: 0.98,
+          rationale: `complete_when condition met — reporting result "${spec.outcome.result}"`,
+        };
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // S1 — classify: tool allowed AND confidence.classify absent
   // -----------------------------------------------------------------------
   if (tools.includes('classify_document') && confidence['classify'] === undefined) {
-    const { type, confidence: conf } = classifyHeuristic(text);
+    const rules = config.classify_rules;
+    const { type, confidence: conf } = classifyHeuristic(text, rules);
+    const params: Record<string, unknown> = { document_type: type };
+    if (rules && rules.length > 0) params['classify_rules'] = rules;
     return {
       action: 'classify_document',
-      params: { document_type: type },
+      params,
       confidence: conf,
       rationale: `Heuristic classification: ${type} (confidence ${conf.toFixed(2)})`,
     };
   }
 
   // -----------------------------------------------------------------------
-  // Rule 2: extract_fields allowed AND confidence.extract absent
+  // S2 — extract: tool allowed AND confidence.extract absent
   // -----------------------------------------------------------------------
   if (tools.includes('extract_fields') && confidence['extract'] === undefined) {
     const { fields, confidence: conf, extraction_meta } = extractHeuristic(text);
@@ -340,7 +545,8 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
   }
 
   // -----------------------------------------------------------------------
-  // Rule 3: match_patient allowed AND no matched_patient_id
+  // S3 — match: tool allowed AND no matched patient. Candidates ride along
+  //       so the runner can attach them to a review request.
   // -----------------------------------------------------------------------
   if (tools.includes('match_patient') && !workItem.matched_patient_id) {
     const result = await matchPatientHeuristic(extracted);
@@ -348,6 +554,7 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
       action: 'match_patient',
       params: {
         patient_id: result.patientId,
+        patientId: result.patientId,
         candidates: result.candidates,
       },
       confidence: result.confidence,
@@ -357,209 +564,174 @@ async function heuristicDecision(input: ReasoningInput): Promise<Decision> {
   }
 
   // -----------------------------------------------------------------------
-  // Rule 4: verify_requirements allowed AND records_request_in AND
-  //         agent_state.requirements absent
+  // S4 — verify: tool allowed AND config.requirements present AND not yet
+  //       verified. The tool is a generic predicate evaluator over the specs.
   // -----------------------------------------------------------------------
   if (
     tools.includes('verify_requirements') &&
-    workItem.type === 'records_request_in' &&
+    Array.isArray(config.requirements) &&
+    config.requirements.length > 0 &&
     agentState['requirements'] === undefined
   ) {
-    const hasPatient = !!workItem.matched_patient_id;
-    const hasRecords = !!(extracted['records_requested'] as string | undefined);
-    const hasAuth =
-      !!(extracted['authorization'] as string | undefined) &&
-      !/to follow/i.test((extracted['authorization'] as string) ?? '');
-    const completeness = [hasPatient, hasRecords, hasAuth].filter(Boolean).length / 3;
-    const conf = hasPatient ? 0.95 : 0.5;
     return {
       action: 'verify_requirements',
-      params: {
-        has_patient: hasPatient,
-        has_records: hasRecords,
-        has_auth: hasAuth,
-        // Store result in agent_state.requirements (tool updated to do this)
-        requirements: { has_patient: hasPatient, has_records: hasRecords, has_auth: hasAuth },
-      },
-      confidence: conf,
-      rationale: `Requirements: patient=${hasPatient}, records=${hasRecords}, auth=${hasAuth} — completeness ${(completeness * 100).toFixed(0)}%`,
-      question: !hasPatient
-        ? 'No matched patient on this records request — verify identity before releasing records.'
-        : undefined,
+      params: { requirements: config.requirements },
+      confidence: 0.95,
+      rationale: `Verifying ${config.requirements.length} configured requirement(s)`,
     };
   }
 
   // -----------------------------------------------------------------------
-  // Rule 5: request_more_info allowed AND requirements verified with missing
-  //         auth AND NOT agent_state.more_info_sent
+  // S5 — request-missing: a verified requirement failed. Send a follow-up
+  //       (once), then wait; escalate when max_requests is exhausted.
   // -----------------------------------------------------------------------
-  if (
-    tools.includes('request_more_info') &&
-    agentState['requirements'] !== undefined &&
-    !(agentState['requirements'] as Record<string, boolean>)['has_auth'] &&
-    !agentState['more_info_sent']
-  ) {
-    return {
-      action: 'request_more_info',
-      params: { reason: 'Missing patient authorization. Please provide signed authorization form.' },
-      confidence: 0.92,
-      rationale: 'Auth missing — sending request_more_info outbound',
-    };
-  }
-
-  // -----------------------------------------------------------------------
-  // Rule 6: Fulfillment send — records_request_in, requirements complete
-  //         (has_auth true), NOT agent_state.records_sent
-  // -----------------------------------------------------------------------
-  if (
-    workItem.type === 'records_request_in' &&
-    agentState['requirements'] !== undefined &&
-    (agentState['requirements'] as Record<string, boolean>)['has_auth'] &&
-    !agentState['records_sent']
-  ) {
-    // Determine preferred channel from org contact (stored in extracted_data or
-    // agent_state.return_channel, fallback to fax for the tool picker)
-    const preferredChannel =
-      (extracted['return_channel'] as string | undefined) ??
-      (agentState['org_preferred_channel'] as string | undefined);
-    const sendTool = pickSendTool(tools, preferredChannel);
-    if (sendTool) {
-      return {
-        action: sendTool,
-        params: { state_flag: 'records_sent' },
-        confidence: 0.92,
-        rationale: `Requirements verified — sending records via ${sendTool}`,
-      };
+  const reqSpecs = Array.isArray(config.requirements) ? config.requirements : undefined;
+  const reqFlags = agentState['requirements'] as Record<string, boolean> | undefined;
+  if (reqSpecs && reqSpecs.length > 0 && reqFlags !== undefined) {
+    const failingSpec = reqSpecs.find((spec) => reqFlags[spec.flag] !== true);
+    if (failingSpec) {
+      if (agentState['more_info_sent']) {
+        const maxRequests = failingSpec.on_missing?.max_requests;
+        const count = (agentState['more_info_count'] as number | undefined) ?? 1;
+        if (maxRequests !== undefined && count >= maxRequests) {
+          const question = 'Still missing after follow-up — handle manually?';
+          return {
+            action: 'request_human_review',
+            params: { question },
+            confidence: 0.95,
+            rationale: `Requirement "${failingSpec.flag}" still failing after ${count} request(s) (max ${maxRequests})`,
+            question,
+          };
+        }
+        return {
+          action: 'wait',
+          params: {},
+          confidence: 0.99,
+          rationale: `More-info request outstanding for "${failingSpec.flag}" — waiting for response`,
+        };
+      }
+      if (tools.includes('request_more_info')) {
+        const message = failingSpec.on_missing?.message ?? DEFAULT_MORE_INFO_MESSAGE;
+        return {
+          action: 'request_more_info',
+          params: { message, reason: message },
+          confidence: 0.92,
+          rationale: `Requirement "${failingSpec.flag}" failed — requesting missing information`,
+        };
+      }
     }
   }
 
   // -----------------------------------------------------------------------
-  // Rule 7: Initial outbound for records_request_out (no agent_state.attempt_no)
-  // Reads both the new {steps:[{channel},...]} shape and legacy {channels:[...]} shape.
+  // S6 — send-per-policy: config.send_policy present, its condition passes
+  //       (explicit `when` or all requirement flags true), and the set_flag
+  //       hasn't been set yet.
   // -----------------------------------------------------------------------
-  if (
-    workItem.type === 'records_request_out' &&
-    !agentState['attempt_no'] &&
-    !agentState['response_received']
-  ) {
-    const chasePlan = agentState['chase_plan'] as
-      | { steps?: Array<{ channel: string; attempt: number }>; channels?: string[] }
+  if (config.send_policy) {
+    const policy = config.send_policy;
+    const condOk = policy.when
+      ? evalCond(workItem, policy.when)
+      : allRequirementFlagsTrue(agentState, reqSpecs);
+    const notYetSent = policy.set_flag ? !agentState[policy.set_flag] : true;
+    if (condOk && notYetSent) {
+      const preferredChannel =
+        (workItem.org?.contact?.preferred_channel as string | undefined) ??
+        (extracted['return_channel'] as string | undefined) ??
+        (agentState['org_preferred_channel'] as string | undefined);
+      const sendTool = pickSendTool(tools, preferredChannel);
+      if (sendTool) {
+        return {
+          action: sendTool,
+          params: { state_flag: policy.set_flag, document_kind: policy.document_kind },
+          confidence: 0.93,
+          rationale: `Send policy satisfied — sending ${policy.document_kind} via ${sendTool}`,
+        };
+      }
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // S7 — chase ladder: config.chase_policy present. Initializes the plan
+  //       from org + config when absent (the SEND carries it as
+  //       params.chase_plan for the send tool to persist), then walks the
+  //       steps via state.attempt_no; exhausted → human review.
+  //       Skipped on response.received — S0 handles arrivals.
+  // -----------------------------------------------------------------------
+  if (config.chase_policy && event?.type !== 'response.received') {
+    const rawPlan = agentState['chase_plan'] as
+      | { steps?: Array<{ channel: string; attempt: number }>; channels?: string[]; waitSeconds?: number }
       | undefined;
-    // Prefer new steps shape, fall back to legacy channels
-    const firstChannel =
-      chasePlan?.steps?.[0]?.channel ??
-      chasePlan?.channels?.[0];
 
-    // care_everywhere is handled by the Records Chaser via send_care_everywhere tool
-    // but since that tool is not in the registry, skip the normal send_tool picker.
-    // The ROI route already creates the initial attempt; agent should just wait
-    // for response and then mark_complete. So return 'wait' for care_everywhere.
-    if (firstChannel === 'care_everywhere') {
-      // No tool call needed — attempt already created by compose route
-      return {
-        action: 'wait',
-        params: {},
-        confidence: 0.99,
-        rationale: 'Care Everywhere attempt already sent — waiting for C-CDA return',
-      };
+    // Normalize: new {steps} shape, legacy {channels} shape, or compute fresh
+    let steps: Array<{ channel: string; attempt: number }> | undefined = rawPlan?.steps;
+    if ((!steps || steps.length === 0) && rawPlan?.channels?.length) {
+      const counter: Record<string, number> = {};
+      steps = rawPlan.channels.map((ch) => {
+        counter[ch] = (counter[ch] ?? 0) + 1;
+        return { channel: ch, attempt: counter[ch] };
+      });
+    }
+    let freshPlan: ChasePlan | undefined;
+    if (!steps || steps.length === 0) {
+      const org = await loadOrgForPlan(workItem.org_id);
+      freshPlan = buildChannelPlan(org ?? {}, config);
+      steps = freshPlan.steps;
     }
 
-    const sendTool = pickSendTool(tools, firstChannel);
-    if (sendTool) {
+    const idx = (agentState['attempt_no'] as number | undefined) ?? 0;
+    if (idx < steps.length) {
+      const channel = steps[idx].channel;
+      const sendTool = pickSendTool(tools, channel);
+      if (sendTool) {
+        const params: Record<string, unknown> = {};
+        if (freshPlan) params['chase_plan'] = freshPlan;
+        return {
+          action: sendTool,
+          params,
+          confidence: 0.9,
+          rationale: `Chase ladder step ${idx + 1}/${steps.length} — sending via ${channel}`,
+        };
+      }
+    } else {
+      const question =
+        config.chase_policy.on_exhausted?.question ??
+        `No response after ${idx} attempts (${steps.map((s) => s.channel).join(', ')}) — call them or close?`;
       return {
-        action: sendTool,
-        params: {},
-        confidence: 0.9,
-        rationale: 'Fresh outgoing ROI — sending initial request via preferred channel',
-      };
-    }
-  }
-
-  // -----------------------------------------------------------------------
-  // Rule 8: mark_complete allowed AND
-  //   (records_request_out with response_received, OR records_request_in with records_sent)
-  // -----------------------------------------------------------------------
-  if (tools.includes('mark_complete')) {
-    if (
-      workItem.type === 'records_request_out' &&
-      agentState['response_received'] &&
-      !alreadyDone.has('mark_complete')
-    ) {
-      const refNo = `ROI-${workItem.id.slice(0, 8).toUpperCase()}`;
-      const lastChannel = (agentState['last_channel'] as string | undefined) ?? 'unknown';
-      return {
-        action: 'mark_complete',
-        params: { note: `Records received via ${lastChannel} — ref ${refNo}.` },
-        confidence: 0.98,
-        rationale: 'Response received — marking complete',
-      };
-    }
-    if (
-      workItem.type === 'records_request_in' &&
-      agentState['records_sent'] &&
-      !alreadyDone.has('mark_complete')
-    ) {
-      return {
-        action: 'mark_complete',
-        params: { note: 'Records sent to requester.' },
-        confidence: 0.98,
-        rationale: 'Records sent — marking complete',
-      };
-    }
-  }
-
-  // -----------------------------------------------------------------------
-  // Rule 9: advance_stage allowed AND queue is intake AND type known
-  // -----------------------------------------------------------------------
-  if (
-    tools.includes('advance_stage') &&
-    workItem.queue_key === 'intake' &&
-    !alreadyDone.has('advance_stage') &&
-    !alreadyDone.has('escalate_to_human')
-  ) {
-    const itemType = workItem.type;
-    const targetQueue =
-      itemType === 'referral'
-        ? 'referrals'
-        : itemType === 'records_request_in'
-          ? 'roi_incoming'
-          : null;
-
-    if (targetQueue) {
-      return {
-        action: 'advance_stage',
-        params: { queue_key: targetQueue, type: itemType },
+        action: 'request_human_review',
+        params: { question },
         confidence: 0.95,
-        rationale: `Routing ${itemType} to ${targetQueue}`,
-      };
-    }
-
-    if (tools.includes('escalate_to_human')) {
-      return {
-        action: 'escalate_to_human',
-        params: {
-          question: 'Unknown document type after classification — cannot route automatically.',
-        },
-        confidence: 0.95,
-        rationale: 'Unknown type, escalating',
+        rationale: `Chase ladder exhausted after ${idx} attempt(s)`,
+        question,
       };
     }
   }
 
   // -----------------------------------------------------------------------
-  // Rule 10: wait fallback
+  // S8 — wait fallback
   // -----------------------------------------------------------------------
   return {
     action: 'wait',
     params: {},
     confidence: 0.99,
-    rationale: 'No applicable step right now — waiting',
+    rationale: 'Nothing to do',
   };
 }
 
 // ---------------------------------------------------------------------------
 // Anthropic API call (used only when key is present and model != 'heuristic')
 // ---------------------------------------------------------------------------
+
+/** Serialize the agent's named policies so the LLM sees the same policy as the heuristic engine. */
+function serializePolicies(agent: Agent): string {
+  const config = agent.config ?? {};
+  const lines: string[] = [];
+  if (config.complete_when) lines.push(`complete_when: ${JSON.stringify(config.complete_when)}`);
+  if (config.requirements) lines.push(`requirements: ${JSON.stringify(config.requirements)}`);
+  if (config.send_policy) lines.push(`send_policy: ${JSON.stringify(config.send_policy)}`);
+  if (config.chase_policy) lines.push(`chase_policy: ${JSON.stringify(config.chase_policy)}`);
+  if (config.classify_rules) lines.push(`classify_rules: ${JSON.stringify(config.classify_rules)}`);
+  return lines.length > 0 ? lines.join('\n') : '(none)';
+}
 
 async function callAnthropic(input: ReasoningInput): Promise<Decision> {
   const apiKey = process.env.ANTHROPIC_API_KEY!;
@@ -568,8 +740,15 @@ async function callAnthropic(input: ReasoningInput): Promise<Decision> {
   const systemPrompt = `You are an AI agent for a healthcare work queue system.
 Your job is to decide the single next action for a work item.
 Respond ONLY with valid JSON matching this schema:
-{"action":"<tool_name>","params":{},"confidence":<0-1>,"rationale":"<string>","question":"<optional string>"}
+{"action":"<tool_name_or_completion_verb>","params":{},"confidence":<0-1>,"rationale":"<string>","question":"<optional string>"}
 Available tools: ${input.agent.tools.join(', ')}
+Legal completion verbs (use exactly one per turn when no tool applies):
+- report_result — the case outcome is reached; params {"result":"<string>","note":"<optional string>"}
+- request_human_review — a human must decide; set "question"
+- emit_event — emit a follow-up event; params {"type":"<event_type>","payload":{}}
+- wait — nothing to do right now
+Agent named policies (these gate your behavior — honor them exactly):
+${serializePolicies(input.agent)}
 Agent instructions: ${input.agent.instructions}`;
 
   const userContent = `Work item:
@@ -582,8 +761,13 @@ ${input.workItem.source_text ?? '(none)'}
 Extracted data:
 ${JSON.stringify(input.workItem.extracted_data, null, 2)}
 
+Agent state:
+${JSON.stringify(input.workItem.agent_state, null, 2)}
+
 Confidence so far:
 ${JSON.stringify(input.workItem.confidence, null, 2)}
+
+Activating event: ${input.event ? `${input.event.type} ${JSON.stringify(input.event.payload)}` : '(manual run)'}
 
 Steps already taken in this run: ${input.stepHistory.join(', ') || 'none'}
 
@@ -654,6 +838,4 @@ export async function reason(input: ReasoningInput): Promise<Decision> {
   return heuristicDecision(input);
 }
 
-// Re-export so agentRunner doesn't need to reach into this module's internals
-export { matchPatientHeuristic };
 export type { Agent };

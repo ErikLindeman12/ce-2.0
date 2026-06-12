@@ -12,6 +12,7 @@ const VALID_SCENARIOS: ScenarioKey[] = [
   'call_referral',
   'call_records_request',
   'fax_referral_partial',
+  'fax_prior_auth',
 ];
 
 const VALID_BATCHES: BatchKey[] = ['batch_morning'];

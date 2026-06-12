@@ -123,9 +123,27 @@ export type ToolName =
 
 export type AgentMode = 'autonomous' | 'supervised' | 'shadow';
 
-export type WorkItemType = 'referral' | 'records_request_in' | 'records_request_out' | 'unknown';
+/**
+ * Open string unions: the platform no longer hardcodes the set of case types or
+ * queues — both are data (seeded or created in the builder). The known literals
+ * are kept for autocomplete; `(string & {})` admits any other value.
+ */
+export type WorkItemType =
+  | 'referral'
+  | 'records_request_in'
+  | 'records_request_out'
+  | 'prior_auth'
+  | 'unknown'
+  | (string & {});
 export type WorkItemStatus = 'open' | 'in_progress' | 'waiting' | 'done' | 'error';
-export type QueueKey = 'intake' | 'referrals' | 'roi_incoming' | 'roi_outgoing' | 'human_review';
+export type QueueKey =
+  | 'intake'
+  | 'referrals'
+  | 'roi_incoming'
+  | 'roi_outgoing'
+  | 'human_review'
+  | 'prior_auth'
+  | (string & {});
 export type OutboundChannel = 'fax' | 'email' | 'sms' | 'voice' | 'portal' | 'care_everywhere';
 export type OutboundAttemptStatus = 'sent' | 'awaiting_response' | 'responded' | 'timed_out' | 'failed';
 
@@ -149,11 +167,25 @@ export interface ChasePlan {
   waitSeconds: number;
 }
 
+export type WorkQueueKind = 'work' | 'review';
+
+/** Per-queue UI config: columns + theme, all data-driven (builder-editable). */
+export interface WorkQueueConfig {
+  theme?: string;
+  columns?: Array<
+    | { type: 'field'; key: string; label: string; path: string }
+    | { type: 'chase_progress' }
+    | { type: 'review_reason' }
+  >;
+}
+
 export interface WorkQueue {
   key: QueueKey;
   name: string;
   description: string | null;
   sort_order: number;
+  kind?: WorkQueueKind;
+  config?: WorkQueueConfig;
   item_count?: number;
 }
 
@@ -181,6 +213,8 @@ export interface WorkItem {
   assignee: string;
   review_reason: string | null;
   agent_state: Record<string, unknown>;
+  state_version: number;
+  claimed_at: string | null;
   created_at: string;
   updated_at: string;
   // joins
@@ -207,6 +241,7 @@ export interface OrgContact {
 export interface Agent {
   id: string;
   name: string;
+  /** Legacy queue binding — superseded by `subscriptions`; kept for back-compat reads. */
   queue_key: QueueKey;
   enabled: boolean;
   instructions: string;
@@ -214,7 +249,9 @@ export interface Agent {
   confidence_threshold: number;
   model: string;
   mode: AgentMode;
-  config: Record<string, unknown>;
+  config: AgentConfig;
+  subscriptions: AgentSubscription[];
+  owner: string | null;
   created_at: string;
 }
 
@@ -230,10 +267,14 @@ export interface AgentStats {
   autoRate: number;
 }
 
+export type OutboundAttemptKind = 'records_request' | 'records_response' | 'request_more_info';
+
 export interface OutboundAttempt {
   id: string;
   work_item_id: string;
   channel: OutboundChannel;
+  kind: OutboundAttemptKind | null;
+  dedupe_key: string | null;
   attempt_no: number;
   to_org_id: string | null;
   to_contact: Record<string, unknown>;
@@ -256,6 +297,171 @@ export interface AuditLogEntry {
   work_item?: Pick<WorkItem, 'id' | 'type' | 'queue_key'> | null;
 }
 
+// =============================================================================
+// Event substrate types (docs/substrate-spec.md)
+// =============================================================================
+
+export interface EventRow {
+  id: string;
+  seq: number;
+  type: string;
+  case_id: string | null;
+  payload: Record<string, unknown>;
+  actor: string;
+  caused_by_event_id: string | null;
+  depth: number;
+  deliver_at: string | null;
+  delivered_at: string | null;
+  dedupe_key: string | null;
+  created_at: string;
+}
+
+export type EventDeliveryStatus = 'pending' | 'running' | 'done' | 'shadowed' | 'skipped';
+
+export interface EventDelivery {
+  id: string;
+  event_id: string;
+  agent_id: string;
+  case_id: string | null;
+  status: EventDeliveryStatus;
+  turn_id: string | null;
+  claimed_at: string | null;
+  created_at: string;
+}
+
+export type ReviewKind = 'approval' | 'question' | 'exception';
+export type ReviewStatus = 'pending' | 'answered' | 'void';
+
+export interface ReviewRequest {
+  id: string;
+  case_id: string;
+  agent_id: string | null;
+  kind: ReviewKind;
+  question: string;
+  proposal: {
+    action: string;
+    params: Record<string, unknown>;
+    confidence: number;
+    rationale: string;
+    state_version: number;
+  } | null;
+  candidates: Record<string, unknown>[] | null;
+  options: Record<string, unknown> | null;
+  queue_key: QueueKey | null;
+  status: ReviewStatus;
+  answer: Record<string, unknown> | null;
+  answered_by: string | null;
+  created_at: string;
+  answered_at: string | null;
+}
+
+export interface RoutingRule {
+  id: string;
+  event_type: string;
+  filter: Record<string, unknown>;
+  queue_key: QueueKey;
+  priority: number;
+  owner: string | null;
+  enabled: boolean;
+  created_at: string;
+}
+
+/** Declarative effects applied atomically to case state BEFORE a turn runs. */
+export interface OnEventEffects {
+  merge_payload?: Array<{ from: string; to: string }>;
+  set_state?: Record<string, unknown>;
+  clear_state?: string[];
+}
+
+export interface AgentSubscription {
+  event_type: string;
+  /**
+   * Equality match against event.payload.* — plus special keys:
+   * `case_type` (matches case.type), `source_channel` (matches case.source_channel).
+   */
+  filter?: Record<string, unknown>;
+  on_event?: OnEventEffects;
+}
+
+// --- Predicate DSL (complete_when / requirements) ---
+
+export type PredOp = 'eq' | 'neq' | 'exists' | 'absent' | 'matches' | 'not_matches' | 'in';
+
+export interface Pred {
+  /** 'state.x' | 'extracted.x' | 'case.type' | 'case.matched_patient_id' | ... */
+  path: string;
+  op: PredOp;
+  value?: unknown;
+}
+
+export interface Cond {
+  all?: Pred[];
+  any?: Pred[];
+}
+
+export interface RequirementSpec {
+  flag: string;
+  path: string;
+  op: PredOp;
+  value?: unknown;
+  and?: Pred[];
+  on_missing?: { message?: string; max_requests?: number };
+}
+
+export interface CompleteWhenSpec {
+  when: Cond;
+  outcome: { result: string; note?: string };
+}
+
+export interface SendPolicySpec {
+  document_kind: 'records_response' | 'records_request';
+  set_flag?: string;
+  when?: Cond;
+}
+
+export interface ChasePolicySpec {
+  steps: string[];
+  waitSeconds?: number;
+  on_exhausted?: { question?: string };
+}
+
+/** Named low-code policies — presence of a policy gates the matching planner skill. */
+export interface AgentConfig {
+  chase_policy?: ChasePolicySpec;
+  requirements?: RequirementSpec[];
+  send_policy?: SendPolicySpec;
+  complete_when?: CompleteWhenSpec[];
+  classify_rules?: Array<{ matches: string; type: string }>;
+  [key: string]: unknown;
+}
+
+export type CompletionVerb = 'report_result' | 'request_human_review' | 'emit_event' | 'wait';
+
+export const COMPLETION_VERBS: CompletionVerb[] = [
+  'report_result',
+  'request_human_review',
+  'emit_event',
+  'wait',
+];
+
+export interface ToolCtx {
+  turnId?: string;
+  deliveryId?: string;
+  event?: EventRow;
+  agent?: Agent;
+}
+
+export interface PumpReport {
+  delivered: number;
+  routed: number;
+  turns: number;
+  shadowed: number;
+  reviews: number;
+  /** Per-turn tool actions, surfaced as toasts by the queues board. */
+  actions: Array<{ itemId: string; action: string; confidence: number; actor: string }>;
+  errors: string[];
+}
+
 // ---------------------------------------------------------------------------
 // LLM / reasoning types
 // ---------------------------------------------------------------------------
@@ -264,6 +470,8 @@ export interface ReasoningInput {
   workItem: WorkItem;
   agent: Agent;
   stepHistory: string[];
+  /** The event that activated this turn (subscription-driven turns). */
+  event?: EventRow;
 }
 
 export interface Decision {
@@ -280,7 +488,19 @@ export interface Decision {
 
 export interface ToolDef {
   description: string;
-  execute: (workItemId: string, params: Record<string, unknown>, actor: string) => Promise<ToolResult>;
+  /**
+   * 'annotate' = enriches the case (classify/extract/match/verify) — runs without
+   * approval in supervised mode. 'external' = visible outside the system (sends,
+   * calls) — gated behind approval in supervised mode. Consumers MUST treat a
+   * missing value as 'external' (the safe default).
+   */
+  effect?: 'annotate' | 'external';
+  execute: (
+    workItemId: string,
+    params: Record<string, unknown>,
+    actor: string,
+    ctx?: ToolCtx
+  ) => Promise<ToolResult>;
 }
 
 export interface ToolResult {
@@ -388,7 +608,24 @@ export interface AgentResponse {
   confidenceThreshold: number;
   model: string;
   mode: AgentMode;
-  config: Record<string, unknown>;
+  config: AgentConfig;
+  subscriptions: AgentSubscription[];
+  owner: string | null;
+  createdAt: string;
+}
+
+/** Camel-case review request for API responses */
+export interface ReviewRequestSummary {
+  id: string;
+  caseId: string;
+  agentId: string | null;
+  agentName?: string | null;
+  kind: ReviewKind;
+  question: string;
+  proposal: ReviewRequest['proposal'];
+  candidates: Record<string, unknown>[] | null;
+  queueKey: QueueKey | null;
+  status: ReviewStatus;
   createdAt: string;
 }
 
@@ -450,6 +687,24 @@ export function toAgentResponse(a: Agent): AgentResponse {
     model: a.model,
     mode: a.mode ?? 'autonomous',
     config: a.config ?? {},
+    subscriptions: a.subscriptions ?? [],
+    owner: a.owner ?? null,
     createdAt: a.created_at,
+  };
+}
+
+export function toReviewRequestSummary(r: ReviewRequest, agentName?: string | null): ReviewRequestSummary {
+  return {
+    id: r.id,
+    caseId: r.case_id,
+    agentId: r.agent_id,
+    agentName: agentName ?? null,
+    kind: r.kind,
+    question: r.question,
+    proposal: r.proposal,
+    candidates: r.candidates,
+    queueKey: r.queue_key,
+    status: r.status,
+    createdAt: r.created_at,
   };
 }

@@ -241,3 +241,199 @@ UPDATE organizations SET channels = array_remove(channels, 'cloud')
 -- info are skipped, which silently collapsed its email→voice ladder).
 UPDATE organizations SET contact = contact || '{"email":"records@mgh.example"}'::jsonb
   WHERE id = 'org_mgh';
+
+-- =============================================================================
+-- EVENT SUBSTRATE SEED (docs/substrate-spec.md §5) — the workflows as data.
+-- Runs AFTER the legacy agent upserts above, so these values are final state.
+-- All statements idempotent: ON CONFLICT upserts or WHERE NOT EXISTS guards.
+-- =============================================================================
+
+-- ---------------------------------------------------------------------------
+-- Work queues: new prior_auth queue + queue kinds + minimal column configs
+-- ---------------------------------------------------------------------------
+INSERT INTO work_queues (key, name, description, sort_order) VALUES
+  ('prior_auth', 'Prior Auth', 'Prior authorization requests being chased with payers', 5)
+ON CONFLICT (key) DO UPDATE
+  SET name        = EXCLUDED.name,
+      description = EXCLUDED.description;
+
+-- human_review is the review surface (cases join through pending review_requests);
+-- everything else is a plain work queue.
+UPDATE work_queues SET kind = 'review' WHERE key = 'human_review' AND kind IS DISTINCT FROM 'review';
+UPDATE work_queues SET kind = 'work'   WHERE key <> 'human_review' AND kind IS DISTINCT FROM 'work';
+
+UPDATE work_queues
+  SET config = '{"columns":[{"type":"field","key":"patient","label":"Patient","path":"extracted.patient_name"},{"type":"chase_progress"}]}'::jsonb
+  WHERE key = 'prior_auth';
+
+UPDATE work_queues
+  SET config = '{"columns":[{"type":"review_reason"}]}'::jsonb
+  WHERE key = 'human_review';
+
+-- ---------------------------------------------------------------------------
+-- Event types: the taxonomy (descriptions power the builder/timeline UI)
+-- ---------------------------------------------------------------------------
+INSERT INTO event_types (type, description) VALUES
+  ('document.received',  'An inbound document arrived (fax, direct message, call artifact, portal submission)'),
+  ('document.classified','A document was classified into a case type'),
+  ('fields.extracted',   'Structured fields were extracted from a document'),
+  ('patient.matched',    'A patient was matched against the MPI'),
+  ('case.created',       'A new case (work item) was created'),
+  ('case.routed',        'The router placed a case into a work queue'),
+  ('case.moved',         'A case was manually moved to another queue'),
+  ('attempt.created',    'An outbound attempt was created (fax, email, sms, voice, care everywhere)'),
+  ('response.received',  'A response to an outbound attempt arrived'),
+  ('attempt.timed_out',  'An outbound attempt timed out with no response'),
+  ('timer.elapsed',      'A durable timer fired'),
+  ('review.requested',   'An agent asked a human for a decision'),
+  ('review.voided',      'A pending review request was voided (stale or superseded)'),
+  ('human.decided',      'A human answered a review request'),
+  ('case.completed',     'A case was completed with a result')
+ON CONFLICT (type) DO UPDATE
+  SET description = EXCLUDED.description;
+
+-- ---------------------------------------------------------------------------
+-- Routing rules: the Router's placement config. routing_rules has no natural
+-- key and survives demo resets, so guard each insert with WHERE NOT EXISTS.
+-- ---------------------------------------------------------------------------
+INSERT INTO routing_rules (event_type, filter, queue_key, priority, owner)
+SELECT 'document.received', '{}'::jsonb, 'intake', 100, 'seed'
+WHERE NOT EXISTS (
+  SELECT 1 FROM routing_rules
+  WHERE event_type = 'document.received' AND queue_key = 'intake' AND filter = '{}'::jsonb
+);
+
+INSERT INTO routing_rules (event_type, filter, queue_key, priority, owner)
+SELECT 'document.classified', '{"as":"referral"}'::jsonb, 'referrals', 100, 'seed'
+WHERE NOT EXISTS (
+  SELECT 1 FROM routing_rules
+  WHERE event_type = 'document.classified' AND queue_key = 'referrals' AND filter = '{"as":"referral"}'::jsonb
+);
+
+INSERT INTO routing_rules (event_type, filter, queue_key, priority, owner)
+SELECT 'document.classified', '{"as":"records_request_in"}'::jsonb, 'roi_incoming', 100, 'seed'
+WHERE NOT EXISTS (
+  SELECT 1 FROM routing_rules
+  WHERE event_type = 'document.classified' AND queue_key = 'roi_incoming' AND filter = '{"as":"records_request_in"}'::jsonb
+);
+
+INSERT INTO routing_rules (event_type, filter, queue_key, priority, owner)
+SELECT 'document.classified', '{"as":"prior_auth"}'::jsonb, 'prior_auth', 100, 'seed'
+WHERE NOT EXISTS (
+  SELECT 1 FROM routing_rules
+  WHERE event_type = 'document.classified' AND queue_key = 'prior_auth' AND filter = '{"as":"prior_auth"}'::jsonb
+);
+
+INSERT INTO routing_rules (event_type, filter, queue_key, priority, owner)
+SELECT 'review.requested', '{}'::jsonb, 'human_review', 100, 'seed'
+WHERE NOT EXISTS (
+  SELECT 1 FROM routing_rules
+  WHERE event_type = 'review.requested' AND queue_key = 'human_review' AND filter = '{}'::jsonb
+);
+
+-- ---------------------------------------------------------------------------
+-- Agents: subscriptions + named policies. These upserts run after (and win
+-- over) the legacy agent blocks above. Tools lose the retired verbs
+-- (advance_stage / mark_complete / escalate_to_human) — completion verbs
+-- (report_result / request_human_review / emit_event / wait) replace them.
+-- mode and enabled are NOT in the DO UPDATE set, so runtime flips
+-- (shadow→live, enable/disable) survive a reseed.
+-- ---------------------------------------------------------------------------
+
+-- Intake Agent: wakes on every inbound document; classify→extract→match.
+INSERT INTO agents (name, queue_key, enabled, mode, instructions, tools, confidence_threshold, model, subscriptions, config)
+  VALUES (
+    'Intake Agent',
+    'intake',
+    true,
+    'autonomous',
+    'Classify inbound documents, extract patient fields, match against the MPI, and route to the appropriate downstream queue. If confidence is below threshold on any step, escalate to Human Review with the specific question.',
+    '{classify_document,extract_fields,match_patient}',
+    0.8,
+    'heuristic',
+    '[{"event_type":"document.received"}]'::jsonb,
+    '{"classify_rules":[{"matches":"prior auth","type":"prior_auth"}]}'::jsonb
+  )
+ON CONFLICT (name) DO UPDATE
+  SET queue_key            = EXCLUDED.queue_key,
+      instructions         = EXCLUDED.instructions,
+      tools                = EXCLUDED.tools,
+      confidence_threshold = EXCLUDED.confidence_threshold,
+      model                = EXCLUDED.model,
+      subscriptions        = EXCLUDED.subscriptions,
+      config               = EXCLUDED.config;
+
+-- ROI Fulfillment Agent: verify requirements → request missing info → send
+-- records → complete. response.received merges the portal/fax authorization
+-- into extracted and re-arms requirement verification.
+INSERT INTO agents (name, queue_key, enabled, mode, instructions, tools, confidence_threshold, model, subscriptions, config)
+  VALUES (
+    'ROI Fulfillment Agent',
+    'roi_incoming',
+    true,
+    'autonomous',
+    'Verify that incoming records requests include a matched patient, a records description, and an authorization line. If complete, send records back via the requester org preferred channel and mark complete. If info is missing, send request_more_info outbound and set item to waiting.',
+    '{verify_requirements,send_fax,send_email,send_sms,request_more_info}',
+    0.8,
+    'heuristic',
+    '[{"event_type":"document.classified","filter":{"as":"records_request_in"}},{"event_type":"response.received","filter":{"case_type":"records_request_in"},"on_event":{"merge_payload":[{"from":"payload.response.authorization","to":"extracted.authorization"}],"clear_state":["requirements"],"set_state":{"response_received":true}}},{"event_type":"human.decided","filter":{"case_type":"records_request_in"}}]'::jsonb,
+    '{"requirements":[{"flag":"has_patient","path":"case.matched_patient_id","op":"exists"},{"flag":"has_records","path":"extracted.records_requested","op":"exists","on_missing":{"message":"Please specify which records are needed."}},{"flag":"has_auth","path":"extracted.authorization","op":"exists","and":[{"path":"extracted.authorization","op":"not_matches","value":"to follow"}],"on_missing":{"message":"Missing patient authorization — please attach a signed authorization.","max_requests":2}}],"send_policy":{"document_kind":"records_response","set_flag":"records_sent"},"complete_when":[{"when":{"all":[{"path":"state.records_sent","op":"eq","value":true}]},"outcome":{"result":"records_sent","note":"Records sent — request fulfilled."}}]}'::jsonb
+  )
+ON CONFLICT (name) DO UPDATE
+  SET queue_key            = EXCLUDED.queue_key,
+      instructions         = EXCLUDED.instructions,
+      tools                = EXCLUDED.tools,
+      confidence_threshold = EXCLUDED.confidence_threshold,
+      model                = EXCLUDED.model,
+      subscriptions        = EXCLUDED.subscriptions,
+      config               = EXCLUDED.config;
+
+-- Records Chaser: owns the outbound chase ladder for records_request_out.
+-- complete_when fires when a response lands (state set by the subscription).
+INSERT INTO agents (name, queue_key, enabled, mode, instructions, tools, confidence_threshold, model, subscriptions, config)
+  VALUES (
+    'Records Chaser',
+    'roi_outgoing',
+    true,
+    'autonomous',
+    'Send outgoing records requests and manage the chase loop. On a fresh item compose and send the initial request via the org preferred channel. When a response arrives mark the item complete with "records received".',
+    '{send_fax,send_email,send_sms,place_call,send_care_everywhere}',
+    0.7,
+    'heuristic',
+    '[{"event_type":"case.created","filter":{"case_type":"records_request_out"}},{"event_type":"attempt.timed_out","filter":{"case_type":"records_request_out"}},{"event_type":"response.received","filter":{"case_type":"records_request_out"},"on_event":{"set_state":{"response_received":true,"last_channel":"$payload.channel"}}}]'::jsonb,
+    '{"chase_policy":{"steps":["fax","fax","voice"],"waitSeconds":30},"complete_when":[{"when":{"all":[{"path":"state.response_received","op":"eq","value":true}]},"outcome":{"result":"records_received","note":"Records received via {{state.last_channel}} — ref ROI-{{case.id8}}."}}]}'::jsonb
+  )
+ON CONFLICT (name) DO UPDATE
+  SET queue_key            = EXCLUDED.queue_key,
+      instructions         = EXCLUDED.instructions,
+      tools                = EXCLUDED.tools,
+      confidence_threshold = EXCLUDED.confidence_threshold,
+      model                = EXCLUDED.model,
+      subscriptions        = EXCLUDED.subscriptions,
+      config               = EXCLUDED.config;
+
+-- Auth Chaser (NEW): prior-auth workflow as pure config — no engine code knows
+-- about it. Ships in shadow mode (flip to live in the builder for the demo).
+INSERT INTO agents (name, queue_key, enabled, mode, instructions, tools, confidence_threshold, model, owner, subscriptions, config)
+  VALUES (
+    'Auth Chaser',
+    'prior_auth',
+    true,
+    'shadow',
+    'Chase payers for prior authorization decisions. Try the configured ladder; escalate to a human when exhausted.',
+    '{send_fax,send_email,place_call}',
+    0.75,
+    'heuristic',
+    'seed',
+    '[{"event_type":"document.classified","filter":{"as":"prior_auth"}},{"event_type":"attempt.timed_out","filter":{"case_type":"prior_auth"}},{"event_type":"response.received","filter":{"case_type":"prior_auth"},"on_event":{"set_state":{"response_received":true,"last_channel":"$payload.channel"}}}]'::jsonb,
+    '{"chase_policy":{"steps":["fax","fax","voice"],"waitSeconds":30,"on_exhausted":{"question":"Payer unresponsive after 3 attempts — call the payer line or park this auth?"}},"complete_when":[{"when":{"all":[{"path":"state.response_received","op":"eq","value":true}]},"outcome":{"result":"auth_received","note":"Authorization decision received via {{state.last_channel}}."}}]}'::jsonb
+  )
+ON CONFLICT (name) DO UPDATE
+  SET queue_key            = EXCLUDED.queue_key,
+      instructions         = EXCLUDED.instructions,
+      tools                = EXCLUDED.tools,
+      confidence_threshold = EXCLUDED.confidence_threshold,
+      model                = EXCLUDED.model,
+      owner                = EXCLUDED.owner,
+      subscriptions        = EXCLUDED.subscriptions,
+      config               = EXCLUDED.config;

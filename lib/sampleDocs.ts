@@ -11,6 +11,7 @@
  *   call_referral         → classify ≥0.9, extract ≥0.9 (CALL SUMMARY block), match ≥0.97
  *   call_records_request  → classify ≥0.9, extract ≥0.9 (CALL SUMMARY block), match ≥0.97
  *   fax_referral_partial  → classify ≥0.9, extract ~0.85 (labeled), match ~0.6 (fuzzy single-candidate)
+ *   fax_prior_auth        → classify ≥0.9 via agent classify_rules ('prior auth'), extract ≥0.85 (labeled), match ≥0.97 (exact name+DOB+MRN)
  */
 
 export type ScenarioKey =
@@ -22,7 +23,8 @@ export type ScenarioKey =
   | 'fax_roi_missing_auth'
   | 'call_referral'
   | 'call_records_request'
-  | 'fax_referral_partial';
+  | 'fax_referral_partial'
+  | 'fax_prior_auth';
 
 export type BatchKey = 'batch_morning';
 
@@ -316,6 +318,50 @@ Priority: Routine
 Provider: Dr. Michael Brooks NPI 8901234567
 
 Please confirm receipt.
+`.trim(),
+  },
+
+  // -------------------------------------------------------------------------
+  // 10. Prior authorization request fax — seeded patient Susan Chen (MRN-00105)
+  //     Classifies as 'prior_auth' via Intake Agent config.classify_rules
+  //     ("prior auth" matches the header) — NOT via the builtin keyword map.
+  //     All labeled fields present → classify ~0.95, extract ~0.9, match ~0.97
+  //     Routes to the prior_auth queue; chased by the Auth Chaser (shadow).
+  // -------------------------------------------------------------------------
+  fax_prior_auth: {
+    scenario: 'fax_prior_auth',
+    source_channel: 'fax',
+    from_org_id: 'org_aurora',
+    source_text: `
+PRIOR AUTHORIZATION REQUEST — FAX TRANSMISSION
+================================================
+From:     Aurora Health Care — Neurology, Dr. Karen Davis
+Fax:      +1-414-555-0242
+Date:     2026-06-11
+
+To:       Froedtert Hospital — Authorization Department
+
+Payer:    Kaiser Permanente — Utilization Management
+Member ID: KP-WI-4471209
+
+Patient:  Susan Chen
+DOB:      1978-05-19
+MRN:      MRN-00105
+Phone:    +1-608-555-0105
+
+Procedure: MRI lumbar spine without contrast
+CPT Code:  72148
+Diagnosis: Chronic low back pain with left L5 radiculopathy (ICD-10 M54.16)
+
+Reason:   Six weeks of conservative therapy (PT and NSAIDs) without improvement.
+          Progressive left leg weakness on exam. MRI needed to evaluate for
+          disc herniation prior to surgical consult.
+
+Priority: Routine
+Ordering Provider: Dr. Karen Davis NPI 4455667788
+
+Please obtain prior authorization from the payer and confirm the
+authorization number by fax.
 `.trim(),
   },
 };
